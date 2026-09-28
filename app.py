@@ -19,7 +19,7 @@ DEFAULT_SERVER = "https://clientbp.ppmainecoonghj.com"
 # =====================================================================
 # গেস্ট অ্যাকাউন্ট: শুধু এই তিন লাইন বদলালেই হবে (uid=...&password=...)
 # =====================================================================
-ACCOUNT_BD = "uid=4418979127&password=RIZER_K4CY1_RIZER_WNX02"                       # BD + বাকি সব রিজিয়ন
+ACCOUNT_BD = "uid=7965111855&password=45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086"                       # BD + বাকি সব রিজিয়ন
 ACCOUNT_IND = "uid=4363983977&password=ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"        # IND
 ACCOUNT_AMERICAS = "uid=4682784982&password=GHOST_TNVW1_RIZER_QTFT0"                 # BR, US, SAC, NA (এটা এখন মৃত)
 

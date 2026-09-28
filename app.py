@@ -16,14 +16,37 @@ RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 DEFAULT_SERVER = "https://clientbp.ppmainecoonghj.com"
 
-# বিডি ও ইন্ডিয়াকে সবার প্রথমে রাখা হয়েছে যাতে দ্রুত রেসপন্স আসে
+# =====================================================================
+# গেস্ট অ্যাকাউন্ট: শুধু এই তিন লাইন বদলালেই হবে (uid=...&password=...)
+# =====================================================================
+ACCOUNT_BD = "uid=4418979127&password=RIZER_K4CY1_RIZER_WNX02"                       # BD + বাকি সব রিজিয়ন
+ACCOUNT_IND = "uid=4363983977&password=ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"        # IND
+ACCOUNT_AMERICAS = "uid=4682784982&password=GHOST_TNVW1_RIZER_QTFT0"                 # BR, US, SAC, NA (এটা এখন মৃত)
+
+ACCOUNTS = {"BD": ACCOUNT_BD, "IND": ACCOUNT_IND, "AMERICAS": ACCOUNT_AMERICAS}
+
+# বিডি ও ইন্ডিয়াকে সবার প্রথমে রাখা হয়েছে
 SUPPORTED_REGIONS = ["BD", "IND", "SG", "BR", "US", "SAC", "NA", "PK", "ID", "TH", "VN", "TW", "RU", "ME", "CIS", "EUROPE"]
+
+RATE_LIMIT_COOLDOWN = 90    # 429 পেলে ওই অ্যাকাউন্ট এত সেকেন্ড বিশ্রামে থাকবে
+TOKEN_FAIL_COOLDOWN = 300   # টোকেন না পেলে এত সেকেন্ড আবার চেষ্টা করা হবে না
 
 app = Flask(__name__)
 CORS(app)
 
-cached_tokens = {}
+cached_tokens = {}        # group -> টোকেন
+blocked_until = {}        # group -> কখন পর্যন্ত Garena রিকোয়েস্ট বন্ধ (429 এর জন্য)
+token_failed_until = {}   # group -> কখন পর্যন্ত টোকেন চেষ্টা বন্ধ
 uid_region_cache = {}
+
+
+def get_group(region: str) -> str:
+    r = region.upper()
+    if r == "IND":
+        return "IND"
+    if r in {"BR", "US", "SAC", "NA"}:
+        return "AMERICAS"
+    return "BD"
 
 
 # === ক্রিপ্টোগ্রাফি হেল্পার ===
@@ -42,28 +65,21 @@ def decode_protobuf(data: bytes, msg_type):
     return inst
 
 
-def get_account_credentials(region: str) -> str:
-    r = region.upper()
-    if r == "IND":
-        return "uid=4363983977&password=ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"
-    elif r in {"BR", "US", "SAC", "NA"}:
-        # সতর্কতা: এই অ্যাকাউন্টটি এখন মৃত (টোকেন খালি আসছে)। নতুন অ্যাকাউন্ট বসাতে হবে।
-        return "uid=4682784982&password=GHOST_TNVW1_RIZER_QTFT0"
-    else:
-        return "uid=4418979127&password=RIZER_K4CY1_RIZER_WNX02"
-
-
-# === টোকেন সংগ্রহ ফাংশন ===
+# === টোকেন সংগ্রহ ফাংশন (অ্যাকাউন্ট গ্রুপ অনুযায়ী ক্যাশ) ===
 def get_token_info(region: str):
-    info = cached_tokens.get(region)
+    group = get_group(region)
     now = time.time()
 
-    # টোকেন ক্যাশে থাকলে পুনরায় ব্যবহার
+    info = cached_tokens.get(group)
     if info and now < info.get('expires_at', 0) - 60:
         return info['token'], info['region'], info['server_url']
 
+    # কিছুক্ষণ আগে ফেল করে থাকলে আবার হ্যামার করবে না
+    if now < token_failed_until.get(group, 0):
+        return None, region, DEFAULT_SERVER
+
     try:
-        creds = parse_qs(get_account_credentials(region))
+        creds = parse_qs(ACCOUNTS[group])
         uid = creds.get("uid", [""])[0]
         password = creds.get("password", [""])[0]
 
@@ -79,37 +95,45 @@ def get_token_info(region: str):
 
                 # মৃত/ব্যান অ্যাকাউন্টে টোকেন ও serverUrl খালি আসে
                 if not raw_token or not msg.get('serverUrl'):
-                    app.logger.error(f"Dead account / empty token for {region}")
+                    app.logger.error(f"Dead account / empty token for {group}")
+                    token_failed_until[group] = now + TOKEN_FAIL_COOLDOWN
                     return None, region, DEFAULT_SERVER
 
                 bearer_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
 
-                # ttl (সেকেন্ড) থেকে মেয়াদ হিসাব করা হচ্ছে
                 try:
                     ttl = int(msg.get('ttl') or 25200)
                 except (TypeError, ValueError):
                     ttl = 25200
 
-                cached_tokens[region] = {
+                cached_tokens[group] = {
                     'token': bearer_token,
                     'region': msg.get('lockRegion') or msg.get('region') or region,
                     'server_url': msg['serverUrl'],
                     'expires_at': now + ttl
                 }
-                return cached_tokens[region]['token'], cached_tokens[region]['region'], cached_tokens[region]['server_url']
+                return cached_tokens[group]['token'], cached_tokens[group]['region'], cached_tokens[group]['server_url']
             else:
-                app.logger.error(f"Token API status {resp.status_code} for {region}")
+                app.logger.error(f"Token API status {resp.status_code} for {group}")
     except Exception as e:
-        app.logger.error(f"Token generation failed for {region}: {e}")
+        app.logger.error(f"Token generation failed for {group}: {e}")
 
+    token_failed_until[group] = now + TOKEN_FAIL_COOLDOWN
     return None, region, DEFAULT_SERVER
 
 
 # === গ্যারিনা অফিশিয়াল সার্ভার রিকোয়েস্ট ===
 def fetch_player_data(uid: str, region: str):
+    group = get_group(region)
+    now = time.time()
+
+    if now < blocked_until.get(group, 0):
+        wait = int(blocked_until[group] - now)
+        raise Exception(f"{group} account rate-limited (429) recently, cooling down {wait}s")
+
     token, lock_reg, server = get_token_info(region)
     if not token:
-        raise Exception(f"Failed to obtain token for region {region}")
+        raise Exception(f"Failed to obtain token for {group} account (dead account or token service problem)")
 
     req = main_pb2.GetPlayerPersonalShow()
     json_format.ParseDict({'a': int(uid), 'b': 7}, req)
@@ -132,8 +156,10 @@ def fetch_player_data(uid: str, region: str):
         if resp.status_code == 200:
             proto_obj = decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
             return json.loads(json_format.MessageToJson(proto_obj))
-        else:
-            raise Exception(f"Garena responded: {resp.status_code}")
+        if resp.status_code == 429:
+            blocked_until[group] = time.time() + RATE_LIMIT_COOLDOWN
+            raise Exception("Garena responded: 429 (rate limited)")
+        raise Exception(f"Garena responded: {resp.status_code}")
 
 
 def has_basic_info(data) -> bool:
@@ -168,35 +194,44 @@ def get_account_info():
         except Exception as e:
             errors["cache_" + uid_region_cache[uid]] = str(e)
 
-    # ২. সব রিজিয়ন স্ক্যান (প্রথমে BD, IND, SG)
+    # ২. স্ক্যান: একই অ্যাকাউন্ট/সার্ভারে বারবার রিকোয়েস্ট না করে প্রতি গ্রুপে একবার
+    tried_groups = set()
+    rate_limited = False
     for region in SUPPORTED_REGIONS:
+        group = get_group(region)
+        if group in tried_groups:
+            continue
+        tried_groups.add(group)
         try:
             data = fetch_player_data(uid, region)
             if has_basic_info(data):
                 uid_region_cache[uid] = region
                 return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
-            errors[region] = "response ok but no basicInfo (UID not in this region?)"
+            errors[group] = "response ok but no basicInfo (UID not on this server?)"
         except Exception as e:
-            errors[region] = str(e)
-            continue
+            errors[group] = str(e)
+            if "429" in str(e):
+                rate_limited = True
 
-    # কেন ফেল হলো সেটা details এ দেখা যাবে
-    return jsonify({"error": "UID not found in any region.", "details": errors}), 404
+    result = {"error": "UID not found in any region.", "details": errors}
+    if rate_limited:
+        result["hint"] = "Garena rate-limited the guest account (429). Wait 1-2 minutes, or replace the guest accounts at the top of app.py."
+    return jsonify(result), 404
 
 
-# === ডিবাগ রুট: সমস্যা কোথায় সেটা বের করার জন্য ===
+# === ডিবাগ রুট ===
 # ব্যবহার: /debug?uid=আপনার_UID&region=BD
 @app.route('/debug', methods=['GET'])
 def debug():
     uid = request.args.get('uid', '')
     region = request.args.get('region', 'BD').upper()
-    out = {"region": region, "release": RELEASEVERSION}
+    group = get_group(region)
+    out = {"region": region, "account_group": group, "release": RELEASEVERSION}
 
     if not uid.isdigit():
         out["problem"] = "uid দিন (সংখ্যা)"
         return jsonify(out), 400
 
-    # ধাপ ১: টোকেন
     try:
         token, lock_reg, server = get_token_info(region)
         out["token_ok"] = bool(token)
@@ -210,7 +245,6 @@ def debug():
         out["problem"] = "token পাওয়া যায়নি (অ্যাকাউন্ট মৃত বা টোকেন সার্ভিস সমস্যা)"
         return jsonify(out)
 
-    # ধাপ ২: Garena রিকোয়েস্ট
     try:
         req = main_pb2.GetPlayerPersonalShow()
         json_format.ParseDict({'a': int(uid), 'b': 7}, req)
@@ -232,7 +266,6 @@ def debug():
         out["garena_body_len"] = len(r.content)
 
         if r.status_code == 200:
-            # ধাপ ৩: ডিকোড
             try:
                 proto_obj = decode_protobuf(r.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
                 parsed = json.loads(json_format.MessageToJson(proto_obj))

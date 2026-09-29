@@ -2,15 +2,18 @@ import time
 import httpx
 import json
 import base64
-from flask import Flask, request, jsonify
+import io
+import requests
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from proto import main_pb2, AccountPersonalShow_pb2
 from google.protobuf import json_format
 from Crypto.Cipher import AES
 from urllib.parse import parse_qs
+from PIL import Image, ImageDraw, ImageFont
 
 # ==============================================================================
-# 🎮 GUEST ACCOUNTS CONFIGURATION (আপনার নতুন গেস্ট আইডিগুলো সেট করা হয়েছে)
+# 🎮 GUEST ACCOUNTS CONFIGURATION (আপনার এই ৪টি আইডিতেই সব চলবে!)
 # ==============================================================================
 INFO_CREDENTIALS = {
     "BD": "uid=7965111855&password=45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086",
@@ -37,11 +40,12 @@ BAN_CREDENTIALS = {
 }
 # ==============================================================================
 
-MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==') # Yg&tc%DEuh6%Zc^8
-MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')  # 6oyZDr22E3ychjM%
+MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
+MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
 RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = ["BD", "IND", "SG", "BR", "US", "SAC", "NA", "PK", "ID", "TH", "VN", "TW", "RU", "ME", "CIS", "EUROPE"]
+CDN_BASE = "https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG"
 
 app = Flask(__name__)
 CORS(app)
@@ -49,7 +53,6 @@ CORS(app)
 cached_tokens = {}
 uid_region_cache = {}
 
-# ক্রিপ্টোগ্রাফি হেল্পার
 def pad(text: bytes) -> bytes:
     n = AES.block_size - (len(text) % AES.block_size)
     return text + bytes([n] * n)
@@ -142,47 +145,27 @@ def fetch_player_data(uid: str, region: str = "BD"):
         else:
             raise Exception(f"Garena responded: {resp.status_code}")
 
-# ==============================================================================
-# 🧮 STATS CALCULATION HELPERS (KD, HS%, WIN% অটোমেটিক হিসাব করার ফাংশন)
-# ==============================================================================
 def calculate_br_mode(mode_data):
-    """Squad, Duo বা Solo-র জন্য KD, HS Rate, Win Rate হিসাব করে"""
     if not mode_data:
         return {"games_played": 0, "wins": 0, "win_rate": "0.0%", "kills": 0, "deaths": 0, "kd_ratio": 0.0, "headshot_kills": 0, "headshot_rate": "0.0%", "damage": 0}
-    
     played = mode_data.get("gamesplayed", 0) or 0
     wins = mode_data.get("wins", 0) or 0
     kills = mode_data.get("kills", 0) or 0
-    
     det = mode_data.get("detailedstats", {}) or {}
     deaths = det.get("deaths", 0) or 0
     hs = det.get("headshotKills", det.get("headshots", 0)) or 0
     damage = det.get("damage", 0) or 0
-    highest_kills = det.get("highestKills", 0) or 0
-    knockdowns = det.get("knockDowns", 0) or 0
-    revives = det.get("revives", 0) or 0
-
     kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
     hs_rate = round((hs / kills) * 100, 2) if kills > 0 else 0.0
     win_rate = round((wins / played) * 100, 2) if played > 0 else 0.0
-
     return {
-        "games_played": played,
-        "wins": wins,
-        "win_rate": f"{win_rate}%",
-        "kills": kills,
-        "deaths": deaths,
-        "kd_ratio": kd,
-        "headshot_kills": hs,
-        "headshot_rate": f"{hs_rate}%",
-        "damage": damage,
-        "highest_kills": highest_kills,
-        "knockdowns": knockdowns,
-        "revivals": revives
+        "games_played": played, "wins": wins, "win_rate": f"{win_rate}%",
+        "kills": kills, "deaths": deaths, "kd_ratio": kd,
+        "headshot_kills": hs, "headshot_rate": f"{hs_rate}%", "damage": damage
     }
 
 # ==============================================================================
-# 🌐 API ENDPOINTS (সব রুট এক সার্ভারে)
+# 🌐 API ENDPOINTS
 # ==============================================================================
 
 @app.route('/', methods=['GET'])
@@ -194,9 +177,10 @@ def root_index():
         "supported_server": "Only BD Server Active",
         "endpoints": {
             "player_info": "/player-info?uid=YOUR_UID",
-            "br_stats": "/stats/br?uid=YOUR_UID&mode=RANKED (or CAREER)",
-            "cs_stats": "/stats/cs?uid=YOUR_UID&mode=RANKED (or CAREER)",
-            "all_stats": "/stats/all?uid=YOUR_UID",
+            "banner": "/banner?uid=YOUR_UID",
+            "avatar": "/avatar?uid=YOUR_UID",
+            "br_stats": "/stats/br?uid=YOUR_UID&mode=RANKED",
+            "cs_stats": "/stats/cs?uid=YOUR_UID&mode=RANKED",
             "ban_check": "/bancheck?uid=YOUR_UID"
         }
     })
@@ -225,7 +209,76 @@ def get_account_info():
 
     return jsonify({"error": "UID not found in any region."}), 404
 
-# 2. 🛡️ BAN CHECK ROUTE
+# 2. 🖼️ BANNER IMAGE GENERATOR ROUTE (নিজের সার্ভার থেকেই ছবি বানাবে!)
+@app.route('/banner', methods=['GET'])
+def get_banner_image():
+    uid = request.args.get('uid')
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "Numeric UID is required"}), 400
+
+    try:
+        p_data = fetch_player_data(uid, "BD")
+        b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
+        c = p_data.get("clanBasicInfo") or p_data.get("clanbasicinfo") or {}
+
+        nickname = b.get("nickname") or b.get("PlayerNickname") or "Player"
+        level = b.get("level") or 0
+        banner_id = b.get("bannerId") or b.get("bannerid") or 901051015
+        avatar_id = b.get("headPic") or b.get("headpic") or 902000052
+        clan_name = c.get("clanName") or c.get("clanname") or ""
+
+        width, height = 600, 120
+        banner_canvas = Image.new("RGBA", (width, height), (15, 23, 42, 255))
+
+        # ব্যানার ও অবতার লোড
+        try:
+            bg_r = requests.get(f"{CDN_BASE}/{banner_id}.png", timeout=4)
+            if bg_r.status_code == 200:
+                bg_img = Image.open(io.BytesIO(bg_r.content)).convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
+                banner_canvas.paste(bg_img, (0, 0), bg_img)
+        except: pass
+
+        try:
+            av_r = requests.get(f"{CDN_BASE}/{avatar_id}.png", timeout=4)
+            if av_r.status_code == 200:
+                av_img = Image.open(io.BytesIO(av_r.content)).convert("RGBA").resize((100, 100), Image.Resampling.LANCZOS)
+                draw_t = ImageDraw.Draw(banner_canvas)
+                draw_t.rectangle([8, 8, 112, 112], fill=(0, 0, 0, 160), outline=(255, 255, 255, 100), width=2)
+                banner_canvas.paste(av_img, (10, 10), av_img)
+        except: pass
+
+        draw = ImageDraw.Draw(banner_canvas)
+        draw.text((130, 24), nickname, fill=(255, 255, 255))
+        if clan_name:
+            draw.text((130, 64), clan_name, fill=(253, 224, 71))
+        draw.text((width - 75, height - 24), f"Lvl.{level}", fill=(255, 255, 255))
+
+        out = io.BytesIO()
+        banner_canvas.save(out, format="PNG")
+        out.seek(0)
+        return send_file(out, mimetype="image/png")
+    except Exception as e:
+        return jsonify({"error": f"Banner render failed: {e}"}), 500
+
+# 3. 👤 AVATAR IMAGE ROUTE
+@app.route('/avatar', methods=['GET'])
+def get_avatar_image():
+    uid = request.args.get('uid')
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "Numeric UID is required"}), 400
+
+    try:
+        p_data = fetch_player_data(uid, "BD")
+        b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
+        avatar_id = b.get("headPic") or b.get("headpic") or 902000052
+        
+        av_r = requests.get(f"{CDN_BASE}/{avatar_id}.png", timeout=5)
+        if av_r.status_code == 200:
+            return send_file(io.BytesIO(av_r.content), mimetype="image/png")
+    except: pass
+    return jsonify({"error": "Avatar image not found"}), 404
+
+# 4. 🛡️ BAN CHECK ROUTE
 @app.route('/bancheck', methods=['GET'])
 def get_ban_status():
     uid = request.args.get('uid')
@@ -261,7 +314,7 @@ def get_ban_status():
             "ban_status": "Clean"
         })
 
-# 3. 🏆 ADVANCED BR STATS ROUTE (KD, Headshot Rate %, Win Rate % হিসাব সহ)
+# 5. 🏆 ADVANCED BR STATS ROUTE
 @app.route('/stats/br', methods=['GET'])
 def get_br_stats():
     uid = request.args.get('uid')
@@ -280,16 +333,15 @@ def get_br_stats():
                 raw = resp.json()
     except: pass
 
-    # যদি আপস্ট্রিম ডেটা না পায়, তবে লাইভ ডেটাবেজ ফলব্যাক
     if not raw:
         try:
             p_data = fetch_player_data(uid, "BD")
             b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
             raw = {
                 "nickname": b.get("nickname", "Xen Shorif"),
-                "quadstats": {"gamesplayed": 78, "wins": 10, "kills": 244, "detailedstats": {"damage": 78400, "deaths": 68, "headshots": 54, "highestKills": 15, "knockDowns": 134, "revives": 23}},
-                "duostats": {"gamesplayed": 5, "wins": 0, "kills": 7, "detailedstats": {"damage": 3824, "deaths": 5, "headshots": 4, "highestKills": 4, "knockDowns": 6, "revives": 2}},
-                "solostats": {"gamesplayed": 2, "wins": 0, "kills": 6, "detailedstats": {"damage": 1095, "deaths": 2, "headshots": 1, "highestKills": 6, "knockDowns": 3, "revives": 0}}
+                "quadstats": {"gamesplayed": 78, "wins": 10, "kills": 244, "detailedstats": {"damage": 78400, "deaths": 68, "headshots": 54}},
+                "duostats": {"gamesplayed": 5, "wins": 0, "kills": 7, "detailedstats": {"damage": 3824, "deaths": 5, "headshots": 4}},
+                "solostats": {"gamesplayed": 2, "wins": 0, "kills": 6, "detailedstats": {"damage": 1095, "deaths": 2, "headshots": 1}}
             }
         except:
             raw = {}
@@ -307,7 +359,7 @@ def get_br_stats():
         "solo": solo
     })
 
-# 4. ⚔️ ADVANCED CS STATS ROUTE (Official KDA, KD, Headshot Rate %, Win Rate % হিসাব সহ)
+# 6. ⚔️ ADVANCED CS STATS ROUTE
 @app.route('/stats/cs', methods=['GET'])
 def get_cs_stats():
     uid = request.args.get('uid')
@@ -333,13 +385,8 @@ def get_cs_stats():
             raw = {
                 "nickname": b.get("nickname", "Xen Shorif"),
                 "csstats": {
-                    "gamesplayed": 42,
-                    "wins": 31,
-                    "kills": 208,
-                    "detailedstats": {
-                        "damage": 81746, "deaths": 96, "assists": 95, "headShotKills": 59, "mvpCount": 18,
-                        "doubleKills": 35, "tripleKills": 15, "fourKills": 7, "knockDowns": 249, "revivals": 38
-                    }
+                    "gamesplayed": 42, "wins": 31, "kills": 208,
+                    "detailedstats": {"damage": 81746, "deaths": 96, "assists": 95, "headShotKills": 59, "mvpCount": 18, "doubleKills": 35, "tripleKills": 15, "fourKills": 7}
                 }
             }
         except:
@@ -353,7 +400,6 @@ def get_cs_stats():
     deaths = det.get('deaths', 0) or 0
     assists = det.get('assists', 0) or 0
     hs = det.get('headShotKills', det.get('headshots', 0)) or 0
-    damage = det.get('damage', 0) or 0
 
     kda = round((kills + assists) / deaths, 2) if deaths > 0 else float(kills + assists)
     kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
@@ -374,27 +420,22 @@ def get_cs_stats():
         "official_kda": kda,
         "headshot_kills": hs,
         "headshot_rate": f"{hs_rate}%",
-        "damage": damage,
+        "damage": det.get('damage', 0) or 0,
         "mvp": det.get("mvpCount", 0) or 0,
         "double_kills": det.get("doubleKills", 0) or 0,
         "triple_kills": det.get("tripleKills", 0) or 0,
-        "quadra_kills": det.get("fourKills", 0) or 0,
-        "knockdowns": det.get("knockDowns", 0) or 0,
-        "revivals": det.get("revivals", 0) or 0
+        "quadra_kills": det.get("fourKills", 0) or 0
     })
 
-# 5. ALL-IN-ONE STATS ROUTE
+# 7. ALL-IN-ONE STATS ROUTE
 @app.route('/stats/all', methods=['GET'])
 def get_all_stats():
     uid = request.args.get('uid')
     if not uid: return jsonify({"error": "UID is required"}), 400
-    
-    br_data = get_br_stats().get_json()
-    cs_data = get_cs_stats().get_json()
     return jsonify({
         "uid": uid,
-        "br_ranked": br_data,
-        "cs_ranked": cs_data
+        "br_ranked": get_br_stats().get_json(),
+        "cs_ranked": get_cs_stats().get_json()
     })
 
 if __name__ == '__main__':

@@ -5,3 +5,4 @@ pycryptodome
 protobuf>=5.28.0,<7.0.0
 requests
 Werkzeug
+Pillow

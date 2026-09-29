@@ -13,7 +13,7 @@ from urllib.parse import parse_qs
 from PIL import Image, ImageDraw, ImageFont
 
 # ==============================================================================
-# 🎮 GUEST ACCOUNTS CONFIGURATION (আপনার এই ৪টি আইডিতেই সব চলবে!)
+# 🎮 GUEST ACCOUNTS CONFIGURATION (আপনার নতুন গেস্ট আইডিগুলো)
 # ==============================================================================
 INFO_CREDENTIALS = {
     "BD": "uid=7965111855&password=45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086",
@@ -40,8 +40,8 @@ BAN_CREDENTIALS = {
 }
 # ==============================================================================
 
-MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==')
-MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')
+MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==') # Yg&tc%DEuh6%Zc^8
+MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')  # 6oyZDr22E3ychjM%
 RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = ["BD", "IND", "SG", "BR", "US", "SAC", "NA", "PK", "ID", "TH", "VN", "TW", "RU", "ME", "CIS", "EUROPE"]
@@ -53,6 +53,7 @@ CORS(app)
 cached_tokens = {}
 uid_region_cache = {}
 
+# ক্রিপ্টোগ্রাফি হেল্পার
 def pad(text: bytes) -> bytes:
     n = AES.block_size - (len(text) % AES.block_size)
     return text + bytes([n] * n)
@@ -165,7 +166,7 @@ def calculate_br_mode(mode_data):
     }
 
 # ==============================================================================
-# 🌐 API ENDPOINTS
+# 🌐 API ENDPOINTS (সব রুট এক সার্ভারে)
 # ==============================================================================
 
 @app.route('/', methods=['GET'])
@@ -179,8 +180,10 @@ def root_index():
             "player_info": "/player-info?uid=YOUR_UID",
             "banner": "/banner?uid=YOUR_UID",
             "avatar": "/avatar?uid=YOUR_UID",
+            "outfit": "/outfit?uid=YOUR_UID",
             "br_stats": "/stats/br?uid=YOUR_UID&mode=RANKED",
             "cs_stats": "/stats/cs?uid=YOUR_UID&mode=RANKED",
+            "all_stats": "/stats/all?uid=YOUR_UID",
             "ban_check": "/bancheck?uid=YOUR_UID"
         }
     })
@@ -209,13 +212,25 @@ def get_account_info():
 
     return jsonify({"error": "UID not found in any region."}), 404
 
-# 2. 🖼️ BANNER IMAGE GENERATOR ROUTE (নিজের সার্ভার থেকেই ছবি বানাবে!)
+# 2. 🖼️ ULTRA HD (2566x550) BANNER IMAGE ROUTE
 @app.route('/banner', methods=['GET'])
 def get_banner_image():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Numeric UID is required"}), 400
 
+    # প্রথমে সরাসরি আসল 2566x550 HD ব্যানার আনার চেষ্টা
+    try:
+        upstream_url = f"https://flash-player-image-v1.vercel.app/banner-image?uid={uid}&key=Flash"
+        headers = {"User-Agent": USERAGENT, "Accept": "image/*"}
+        with httpx.Client(timeout=6.0) as client:
+            resp = client.get(upstream_url, headers=headers)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                return send_file(io.BytesIO(resp.content), mimetype="image/png")
+    except Exception:
+        pass
+
+    # ফলব্যাক: সম্পূর্ণ 2566x550 HD ক্যানভাসে ব্যানার রেন্ডার
     try:
         p_data = fetch_player_data(uid, "BD")
         b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
@@ -227,34 +242,33 @@ def get_banner_image():
         avatar_id = b.get("headPic") or b.get("headpic") or 902000052
         clan_name = c.get("clanName") or c.get("clanname") or ""
 
-        width, height = 600, 120
-        banner_canvas = Image.new("RGBA", (width, height), (15, 23, 42, 255))
+        W, H = 2566, 550
+        canvas = Image.new("RGBA", (W, H), (15, 23, 42, 255))
 
-        # ব্যানার ও অবতার লোড
         try:
-            bg_r = requests.get(f"{CDN_BASE}/{banner_id}.png", timeout=4)
+            bg_r = requests.get(f"{CDN_BASE}/{banner_id}.png", timeout=5)
             if bg_r.status_code == 200:
-                bg_img = Image.open(io.BytesIO(bg_r.content)).convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
-                banner_canvas.paste(bg_img, (0, 0), bg_img)
+                bg_img = Image.open(io.BytesIO(bg_r.content)).convert("RGBA").resize((W - H, H), Image.Resampling.LANCZOS)
+                canvas.paste(bg_img, (H, 0), bg_img)
         except: pass
 
         try:
-            av_r = requests.get(f"{CDN_BASE}/{avatar_id}.png", timeout=4)
+            av_r = requests.get(f"{CDN_BASE}/{avatar_id}.png", timeout=5)
             if av_r.status_code == 200:
-                av_img = Image.open(io.BytesIO(av_r.content)).convert("RGBA").resize((100, 100), Image.Resampling.LANCZOS)
-                draw_t = ImageDraw.Draw(banner_canvas)
-                draw_t.rectangle([8, 8, 112, 112], fill=(0, 0, 0, 160), outline=(255, 255, 255, 100), width=2)
-                banner_canvas.paste(av_img, (10, 10), av_img)
+                av_img = Image.open(io.BytesIO(av_r.content)).convert("RGBA").resize((H - 30, H - 30), Image.Resampling.LANCZOS)
+                draw_t = ImageDraw.Draw(canvas)
+                draw_t.rectangle([5, 5, H - 5, H - 5], fill=(0, 0, 0, 180), outline=(255, 255, 255, 220), width=6)
+                canvas.paste(av_img, (15, 15), av_img)
         except: pass
 
-        draw = ImageDraw.Draw(banner_canvas)
-        draw.text((130, 24), nickname, fill=(255, 255, 255))
+        draw = ImageDraw.Draw(canvas)
+        draw.text((H + 80, 100), nickname, fill=(255, 255, 255), stroke_width=6, stroke_fill=(0, 0, 0))
         if clan_name:
-            draw.text((130, 64), clan_name, fill=(253, 224, 71))
-        draw.text((width - 75, height - 24), f"Lvl.{level}", fill=(255, 255, 255))
+            draw.text((H + 80, 360), clan_name, fill=(254, 240, 138), stroke_width=5, stroke_fill=(0, 0, 0))
+        draw.text((W - 300, H - 100), f"Lvl.{level}", fill=(255, 255, 255), stroke_width=4, stroke_fill=(0, 0, 0))
 
         out = io.BytesIO()
-        banner_canvas.save(out, format="PNG")
+        canvas.save(out, format="PNG")
         out.seek(0)
         return send_file(out, mimetype="image/png")
     except Exception as e:
@@ -278,7 +292,24 @@ def get_avatar_image():
     except: pass
     return jsonify({"error": "Avatar image not found"}), 404
 
-# 4. 🛡️ BAN CHECK ROUTE
+# 4. 🥋 OUTFIT IMAGE ROUTE
+@app.route('/outfit', methods=['GET'])
+def get_outfit_image():
+    uid = request.args.get('uid')
+    if not uid or not uid.isdigit():
+        return jsonify({"error": "Numeric UID is required"}), 400
+
+    try:
+        upstream_url = f"https://flash-player-image-v1.vercel.app/outfit-image?uid={uid}&key=Flash"
+        headers = {"User-Agent": USERAGENT, "Accept": "image/*"}
+        with httpx.Client(timeout=8.0) as client:
+            resp = client.get(upstream_url, headers=headers)
+            if resp.status_code == 200 and len(resp.content) > 1000:
+                return send_file(io.BytesIO(resp.content), mimetype="image/png")
+    except Exception: pass
+    return jsonify({"error": "Outfit image unavailable"}), 404
+
+# 5. 🛡️ BAN CHECK ROUTE
 @app.route('/bancheck', methods=['GET'])
 def get_ban_status():
     uid = request.args.get('uid')
@@ -314,7 +345,7 @@ def get_ban_status():
             "ban_status": "Clean"
         })
 
-# 5. 🏆 ADVANCED BR STATS ROUTE
+# 6. 🏆 ADVANCED BR STATS ROUTE
 @app.route('/stats/br', methods=['GET'])
 def get_br_stats():
     uid = request.args.get('uid')
@@ -359,7 +390,7 @@ def get_br_stats():
         "solo": solo
     })
 
-# 6. ⚔️ ADVANCED CS STATS ROUTE
+# 7. ⚔️ ADVANCED CS STATS ROUTE
 @app.route('/stats/cs', methods=['GET'])
 def get_cs_stats():
     uid = request.args.get('uid')
@@ -427,7 +458,7 @@ def get_cs_stats():
         "quadra_kills": det.get("fourKills", 0) or 0
     })
 
-# 7. ALL-IN-ONE STATS ROUTE
+# 8. ALL-IN-ONE STATS ROUTE
 @app.route('/stats/all', methods=['GET'])
 def get_all_stats():
     uid = request.args.get('uid')

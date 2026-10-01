@@ -1,46 +1,53 @@
+import os
 import time
 import httpx
 import json
 import base64
-import io
-import requests
 import itertools
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from proto import main_pb2, AccountPersonalShow_pb2
 from google.protobuf import json_format
 from Crypto.Cipher import AES
-from urllib.parse import parse_qs
-from PIL import Image, ImageDraw, ImageFont
-
-# ==============================================================================
-# 🎮 GUEST ACCOUNTS POOL (চক্রাকারে একেকবার একেক আইডি দিয়ে রিকোয়েস্ট যাবে)
-# ==============================================================================
-BD_GUEST_ACCOUNTS = [
-    {"uid": "7965111855", "password": "45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086"}
-]
-
-# অন্যান্য রিজিয়ন
-IND_CREDENTIALS = {"uid": "4363983977", "password": "ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"}
-GLOBAL_CREDENTIALS = {"uid": "4682784982", "password": "GHOST_TNVW1_RIZER_QTFT0"}
-
-# সাইক্লিক রোটেটর (Round-Robin Iterator)
-bd_guest_cycle = itertools.cycle(BD_GUEST_ACCOUNTS)
-# ==============================================================================
 
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==') # Yg&tc%DEuh6%Zc^8
 MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')  # 6oyZDr22E3ychjM%
 RELEASEVERSION = "OB55"
 USERAGENT = "Dalvik/2.1.0 (Linux; U; Android 13; CPH2095 Build/RKQ1.211119.001)"
 SUPPORTED_REGIONS = ["BD", "IND", "SG", "BR", "US", "SAC", "NA", "PK", "ID", "TH", "VN", "TW", "RU", "ME", "CIS", "EUROPE"]
-CDN_BASE = "https://cdn.jsdelivr.net/gh/ShahGCreator/icon@main/PNG"
 
 app = Flask(__name__)
 CORS(app)
 
+# ==============================================================================
+# 📂 ACCOUNTS LOADER (accounts.json ফাইল থেকে স্বয়ংক্রিয়ভাবে লোড হবে)
+# ==============================================================================
+def load_accounts_config():
+    acc_file = os.path.join(os.path.dirname(__file__), "accounts.json")
+    if os.path.exists(acc_file):
+        try:
+            with open(acc_file, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # ফলব্যাক ডিফল্ট
+    return {
+        "BD": [
+            {"uid": "7965111855", "password": "45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086"},
+            {"uid": "7966603004", "password": "1B3DF4391F1932B786A74881C8EADD58770F5141BFD70356D0FE6864BDDC6C96"},
+            {"uid": "7967157776", "password": "A91C5BD673E6EFCB1CF22FC0B2E542CD15D329E58C5A2B1768E39BB9732D64FE"},
+            {"uid": "7967766964", "password": "015FFECDC15C208C5E9F220DEB82D1903C1CCCA89A6C586AE98E52EA32AD905B"}
+        ],
+        "IND": [{"uid": "4363983977", "password": "ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"}],
+        "GLOBAL": [{"uid": "4682784982", "password": "GHOST_TNVW1_RIZER_QTFT0"}]
+    }
+
+ACCOUNTS_CONFIG = load_accounts_config()
+bd_cycle = itertools.cycle(ACCOUNTS_CONFIG.get("BD", []))
 cached_tokens = {}
 uid_region_cache = {}
 
+# ক্রিপ্টোগ্রাফি হেল্পার
 def pad(text: bytes) -> bytes:
     n = AES.block_size - (len(text) % AES.block_size)
     return text + bytes([n] * n)
@@ -53,16 +60,17 @@ def decode_protobuf(data: bytes, msg_type):
     inst.ParseFromString(data)
     return inst
 
-# 🌟 প্রতি কলে নতুন গেস্ট আইডি নেওয়ার ফাংশন (Rotation)
+# 🌟 প্রতি রিকোয়েস্টে আলাদা গেস্ট আইডি নির্বাচন (Rotation)
 def get_next_credentials(region: str) -> dict:
     r = region.upper()
     if r == "IND":
-        return IND_CREDENTIALS
+        ind_list = ACCOUNTS_CONFIG.get("IND", [])
+        return ind_list[0] if ind_list else {"uid": "4363983977", "password": ""}
     elif r in {"BR", "US", "SAC", "NA"}:
-        return GLOBAL_CREDENTIALS
+        glob_list = ACCOUNTS_CONFIG.get("GLOBAL", [])
+        return glob_list[0] if glob_list else {"uid": "4682784982", "password": ""}
     else:
-        # বিডি সার্ভারের ৪টি আইডি একেকবার একেকটা নেওয়া হবে
-        return next(bd_guest_cycle)
+        return next(bd_cycle)
 
 def get_token_info(region: str):
     cred = get_next_credentials(region)
@@ -70,7 +78,6 @@ def get_token_info(region: str):
     guest_pwd = cred["password"]
 
     now = time.time()
-    # নির্দিষ্ট গেস্ট আইডির জন্য টোকেন ক্যাশ আছে কিনা চেক
     if guest_uid in cached_tokens and now < cached_tokens[guest_uid].get('expires_at', 0) - 60:
         info = cached_tokens[guest_uid]
         return info['token'], info['region'], info['server_url']
@@ -138,13 +145,15 @@ def calculate_br_mode(mode_data):
     deaths = det.get("deaths", 0) or 0
     hs = det.get("headshotKills", det.get("headshots", 0)) or 0
     damage = det.get("damage", 0) or 0
+    highest_kills = det.get("highestKills", 0) or 0
     kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
     hs_rate = round((hs / kills) * 100, 2) if kills > 0 else 0.0
     win_rate = round((wins / played) * 100, 2) if played > 0 else 0.0
     return {
         "games_played": played, "wins": wins, "win_rate": f"{win_rate}%",
         "kills": kills, "deaths": deaths, "kd_ratio": kd,
-        "headshot_kills": hs, "headshot_rate": f"{hs_rate}%", "damage": damage
+        "headshot_kills": hs, "headshot_rate": f"{hs_rate}%", "damage": damage,
+        "highest_kills": highest_kills
     }
 
 # ==============================================================================
@@ -157,8 +166,7 @@ def root_index():
         "status": "Online",
         "service": "Xen Shorif Master Free Fire API",
         "developer": "@xen_shorif",
-        "rotation_system": "Round-Robin 4 Guest IDs Enabled",
-        "supported_server": "Only BD Server Active",
+        "accounts_config": "accounts.json (Active)",
         "endpoints": {
             "player_info": "/player-info?uid=YOUR_UID",
             "banner": "/banner?uid=YOUR_UID",
@@ -194,89 +202,23 @@ def get_account_info():
 
     return jsonify({"error": "UID not found in any region."}), 404
 
-# 2. 🖼️ ULTRA HD (2566x550) BANNER IMAGE ROUTE (ব্যানার ও অবতার একসাথে আসল HD)
+# 2. 🖼️ ULTRA HD (2566x550) BANNER ROUTE (ফিক্সড: সরাসরি আসল HD ব্যানার লোড হবে)
 @app.route('/banner', methods=['GET'])
 def get_banner_image():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Numeric UID is required"}), 400
+    # সরাসরি আসল HD ব্যানারে রিডাইরেক্ট (কোনো ব্লার বা চ্যাপ্টা হবে না)
+    return redirect(f"https://flash-player-image-v1.vercel.app/banner-image?uid={uid}&key=Flash", code=302)
 
-    headers = {"User-Agent": USERAGENT, "Accept": "image/*"}
-    
-    # প্রথমে সরাসরি আসল 2566x550 HD ব্যানার আনার চেষ্টা (ডবল ফলব্যাক সহ)
-    for base in ["https://flash-player-image-v1.vercel.app", "https://flash-player-image.vercel.app"]:
-        try:
-            url = f"{base}/banner-image?uid={uid}&key=Flash"
-            r = requests.get(url, headers=headers, timeout=5, verify=False)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return send_file(io.BytesIO(r.content), mimetype="image/png")
-        except:
-            continue
-
-    # ফলব্যাক: 2566x550 ক্যানভাসে নিজস্ব ব্যানার জেনারেটর
-    try:
-        p_data = fetch_player_data(uid, "BD")
-        b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
-        c = p_data.get("clanBasicInfo") or p_data.get("clanbasicinfo") or {}
-
-        nickname = b.get("nickname") or b.get("PlayerNickname") or "Player"
-        level = b.get("level") or 0
-        banner_id = b.get("bannerId") or b.get("bannerid") or 901051015
-        avatar_id = b.get("headPic") or b.get("headpic") or 902000052
-        clan_name = c.get("clanName") or c.get("clanname") or ""
-
-        W, H = 2566, 550
-        canvas = Image.new("RGBA", (W, H), (15, 23, 42, 255))
-
-        try:
-            bg_r = requests.get(f"{CDN_BASE}/{banner_id}.png", timeout=5)
-            if bg_r.status_code == 200:
-                bg_img = Image.open(io.BytesIO(bg_r.content)).convert("RGBA").resize((W - H, H), Image.Resampling.LANCZOS)
-                canvas.paste(bg_img, (H, 0), bg_img)
-        except: pass
-
-        try:
-            av_r = requests.get(f"{CDN_BASE}/{avatar_id}.png", timeout=5)
-            if av_r.status_code == 200:
-                av_img = Image.open(io.BytesIO(av_r.content)).convert("RGBA").resize((H - 30, H - 30), Image.Resampling.LANCZOS)
-                draw_t = ImageDraw.Draw(canvas)
-                draw_t.rectangle([5, 5, H - 5, H - 5], fill=(0, 0, 0, 180), outline=(255, 255, 255, 220), width=6)
-                canvas.paste(av_img, (15, 15), av_img)
-        except: pass
-
-        draw = ImageDraw.Draw(canvas)
-        draw.text((H + 80, 100), nickname, fill=(255, 255, 255), stroke_width=6, stroke_fill=(0, 0, 0))
-        if clan_name:
-            draw.text((H + 80, 360), clan_name, fill=(254, 240, 138), stroke_width=5, stroke_fill=(0, 0, 0))
-        draw.text((W - 300, H - 100), f"Lvl.{level}", fill=(255, 255, 255), stroke_width=4, stroke_fill=(0, 0, 0))
-
-        out = io.BytesIO()
-        canvas.save(out, format="PNG")
-        out.seek(0)
-        return send_file(out, mimetype="image/png")
-    except Exception as e:
-        return jsonify({"error": f"Banner render failed: {e}"}), 500
-
-# 3. 🥋 OUTFIT IMAGE ROUTE (ফিক্সড - সরাসরি ট্রান্সপারেন্ট ক্যারেক্টার ছবি দেবে)
+# 3. 🥋 OUTFIT IMAGE ROUTE (ফিক্সড: সরাসরি ক্রিস্টাল ক্লিয়ার ক্যারেক্টার লোড হবে)
 @app.route('/outfit', methods=['GET'])
 def get_outfit_image():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Numeric UID is required"}), 400
-
-    headers = {"User-Agent": USERAGENT, "Accept": "image/*"}
-    
-    # ডবল সার্ভার ফলব্যাক
-    for base in ["https://flash-player-image-v1.vercel.app", "https://flash-player-image.vercel.app"]:
-        try:
-            url = f"{base}/outfit-image?uid={uid}&key=Flash"
-            r = requests.get(url, headers=headers, timeout=6, verify=False)
-            if r.status_code == 200 and len(r.content) > 1000:
-                return send_file(io.BytesIO(r.content), mimetype="image/png")
-        except:
-            continue
-
-    return jsonify({"error": "Outfit image unavailable"}), 404
+    # সরাসরি আসল আউটফিট ইমেজে রিডাইরেক্ট
+    return redirect(f"https://flash-player-image-v1.vercel.app/outfit-image?uid={uid}&key=Flash", code=302)
 
 # 4. 🛡️ BAN CHECK ROUTE
 @app.route('/bancheck', methods=['GET'])
@@ -339,9 +281,9 @@ def get_br_stats():
             b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
             raw = {
                 "nickname": b.get("nickname", "Xen Shorif"),
-                "quadstats": {"gamesplayed": 78, "wins": 10, "kills": 244, "detailedstats": {"damage": 78400, "deaths": 68, "headshots": 54, "highestKills": 15, "knockDowns": 134, "revives": 23}},
-                "duostats": {"gamesplayed": 5, "wins": 0, "kills": 7, "detailedstats": {"damage": 3824, "deaths": 5, "headshots": 4, "highestKills": 4, "knockDowns": 6, "revives": 2}},
-                "solostats": {"gamesplayed": 2, "wins": 0, "kills": 6, "detailedstats": {"damage": 1095, "deaths": 2, "headshots": 1, "highestKills": 6, "knockDowns": 3, "revives": 0}}
+                "quadstats": {"gamesplayed": 78, "wins": 10, "kills": 244, "detailedstats": {"damage": 78400, "deaths": 68, "headshots": 54, "highestKills": 15}},
+                "duostats": {"gamesplayed": 5, "wins": 0, "kills": 7, "detailedstats": {"damage": 3824, "deaths": 5, "headshots": 4, "highestKills": 4}},
+                "solostats": {"gamesplayed": 2, "wins": 0, "kills": 6, "detailedstats": {"damage": 1095, "deaths": 2, "headshots": 1, "highestKills": 6}}
             }
         except:
             raw = {}
@@ -385,12 +327,10 @@ def get_cs_stats():
             raw = {
                 "nickname": b.get("nickname", "Xen Shorif"),
                 "csstats": {
-                    "gamesplayed": 42,
-                    "wins": 31,
-                    "kills": 208,
+                    "gamesplayed": 42, "wins": 31, "kills": 208,
                     "detailedstats": {
                         "damage": 81746, "deaths": 96, "assists": 95, "headShotKills": 59, "mvpCount": 18,
-                        "doubleKills": 35, "tripleKills": 15, "fourKills": 7, "knockDowns": 249, "revivals": 38
+                        "doubleKills": 35, "tripleKills": 15, "fourKills": 7
                     }
                 }
             }
@@ -405,7 +345,6 @@ def get_cs_stats():
     deaths = det.get('deaths', 0) or 0
     assists = det.get('assists', 0) or 0
     hs = det.get('headShotKills', det.get('headshots', 0)) or 0
-    damage = det.get('damage', 0) or 0
 
     kda = round((kills + assists) / deaths, 2) if deaths > 0 else float(kills + assists)
     kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
@@ -426,13 +365,11 @@ def get_cs_stats():
         "official_kda": kda,
         "headshot_kills": hs,
         "headshot_rate": f"{hs_rate}%",
-        "damage": damage,
+        "damage": det.get('damage', 0) or 0,
         "mvp": det.get("mvpCount", 0) or 0,
         "double_kills": det.get("doubleKills", 0) or 0,
         "triple_kills": det.get("tripleKills", 0) or 0,
-        "quadra_kills": det.get("fourKills", 0) or 0,
-        "knockdowns": det.get("knockDowns", 0) or 0,
-        "revivals": det.get("revivals", 0) or 0
+        "quadra_kills": det.get("fourKills", 0) or 0
     })
 
 # 7. ALL-IN-ONE STATS ROUTE
@@ -440,13 +377,10 @@ def get_cs_stats():
 def get_all_stats():
     uid = request.args.get('uid')
     if not uid: return jsonify({"error": "UID is required"}), 400
-    
-    br_data = get_br_stats().get_json()
-    cs_data = get_cs_stats().get_json()
     return jsonify({
         "uid": uid,
-        "br_ranked": br_data,
-        "cs_ranked": cs_data
+        "br_ranked": get_br_stats().get_json(),
+        "cs_ranked": get_cs_stats().get_json()
     })
 
 if __name__ == '__main__':

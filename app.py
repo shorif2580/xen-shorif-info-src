@@ -9,6 +9,8 @@ from flask_cors import CORS
 from proto import main_pb2, AccountPersonalShow_pb2
 from google.protobuf import json_format
 from Crypto.Cipher import AES
+from flask import Response
+import imagegen
 
 MAIN_KEY = base64.b64decode('WWcmdGMlREV1aDYlWmNeOA==') # Yg&tc%DEuh6%Zc^8
 MAIN_IV = base64.b64decode('Nm95WkRyMjJFM3ljaGpNJQ==')  # 6oyZDr22E3ychjM%
@@ -35,8 +37,7 @@ def load_accounts_config():
         "BD": [
             {"uid": "7965111855", "password": "45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086"},
             {"uid": "7966603004", "password": "1B3DF4391F1932B786A74881C8EADD58770F5141BFD70356D0FE6864BDDC6C96"},
-            {"uid": "7967157776", "password": "A91C5BD673E6EFCB1CF22FC0B2E542CD15D329E58C5A2B1768E39BB9732D64FE"},
-            {"uid": "7967766964", "password": "015FFECDC15C208C5E9F220DEB82D1903C1CCCA89A6C586AE98E52EA32AD905B"}
+            {"uid": "7967157776", "password": "A91C5BD673E6EFCB1CF22FC0B2E542CD15D329E58C5A2B1768E39BB9732D64FE"}
         ],
         "IND": [{"uid": "4363983977", "password": "ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"}],
         "GLOBAL": [{"uid": "4682784982", "password": "GHOST_TNVW1_RIZER_QTFT0"}]
@@ -135,6 +136,23 @@ def fetch_player_data(uid: str, region: str = "BD"):
         else:
             raise Exception(f"Garena responded: {resp.status_code}")
 
+
+def get_player_data(uid: str):
+    """UID-র ডেটা খুঁজে আনে (ক্যাশ করা রিজিয়ন আগে, তারপর বাকিগুলো)"""
+    order = ([uid_region_cache[uid]] if uid in uid_region_cache else []) + [r for r in SUPPORTED_REGIONS if r != uid_region_cache.get(uid)]
+    for region in order:
+        try:
+            data = fetch_player_data(uid, region)
+            if data and (data.get("basicInfo") or data.get("basic_info")):
+                uid_region_cache[uid] = region
+                return data
+        except Exception:
+            continue
+    return None
+
+def png_response(png_bytes):
+    return Response(png_bytes, mimetype="image/png", headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"})
+
 def calculate_br_mode(mode_data):
     if not mode_data:
         return {"games_played": 0, "wins": 0, "win_rate": "0.0%", "kills": 0, "deaths": 0, "kd_ratio": 0.0, "headshot_kills": 0, "headshot_rate": "0.0%", "damage": 0}
@@ -202,23 +220,35 @@ def get_account_info():
 
     return jsonify({"error": "UID not found in any region."}), 404
 
-# 2. 🖼️ ULTRA HD (2566x550) BANNER ROUTE (ফিক্সড: সরাসরি আসল HD ব্যানার লোড হবে)
+# 2. 🖼️ BANNER ROUTE (নিজস্ব জেনারেটর — Flash API লাগে না)
 @app.route('/banner', methods=['GET'])
 def get_banner_image():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Numeric UID is required"}), 400
-    # সরাসরি আসল HD ব্যানারে রিডাইরেক্ট (কোনো ব্লার বা চ্যাপ্টা হবে না)
-    return redirect(f"https://flash-player-image-v1.vercel.app/banner-image?uid={uid}&key=Flash", code=302)
+    data = get_player_data(uid)
+    if not data:
+        return jsonify({"error": "UID not found in any region."}), 404
+    try:
+        return png_response(imagegen.banner_image(data))
+    except Exception as e:
+        app.logger.error(f"banner error: {e}")
+        return jsonify({"error": f"Banner generation failed: {e}"}), 500
 
-# 3. 🥋 OUTFIT IMAGE ROUTE (ফিক্সড: সরাসরি ক্রিস্টাল ক্লিয়ার ক্যারেক্টার লোড হবে)
+# 3. 🥋 OUTFIT ROUTE (নিজস্ব জেনারেটর)
 @app.route('/outfit', methods=['GET'])
 def get_outfit_image():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Numeric UID is required"}), 400
-    # সরাসরি আসল আউটফিট ইমেজে রিডাইরেক্ট
-    return redirect(f"https://flash-player-image-v1.vercel.app/outfit-image?uid={uid}&key=Flash", code=302)
+    data = get_player_data(uid)
+    if not data:
+        return jsonify({"error": "UID not found in any region."}), 404
+    try:
+        return png_response(imagegen.outfit_image(data))
+    except Exception as e:
+        app.logger.error(f"outfit error: {e}")
+        return jsonify({"error": f"Outfit generation failed: {e}"}), 500
 
 # 4. 🛡️ BAN CHECK ROUTE
 @app.route('/bancheck', methods=['GET'])

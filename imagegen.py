@@ -20,54 +20,68 @@ _ICON_CACHE = {}
 _POOL = ThreadPoolExecutor(max_workers=10)
 
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
-# প্রতিটি অক্ষরের জন্য প্রথম যে ফন্টে গ্লিফ আছে সেটা ব্যবহার হয় (ফলব্যাক চেইন)
-FONT_FILES = ["DejaVuSans-Bold.ttf", "FreeSerifBold.ttf", "FreeSerif.ttf", "unifont.otf", "unifont_upper.otf"]
+# ফন্ট এখন কোডের ভেতরেই এমবেডেড (fontdata.py) — fonts/ ফোল্ডার না থাকলেও চলবে।
+# fonts/ ফোল্ডার থাকলে সেটা অতিরিক্ত কভারেজ হিসেবে (শেষে) যোগ হয়।
+EMBED_ORDER = ["dejavu", "serif", "uni"]
+FOLDER_FILES = ["DejaVuSans-Bold.ttf", "FreeSerifBold.ttf", "FreeSerif.ttf", "unifont.otf", "unifont_upper.otf"]
 # অদৃশ্য/ফাঁকা অক্ষর (গেমের নামে ফাঁক বোঝাতে ব্যবহার হয়) — বক্স না দেখিয়ে স্পেস ধরা হবে
 BLANKS = {0x3164, 0x2800, 0x115F, 0x1160, 0xFFA0, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000}
 
-_FONT_CMAPS = {}
+_FOLDER_CMAPS = {}
 _FONT_OBJS = {}
-
 _FONT_ERR = []
+_EMBED_OK = []
 
-def _load_cmaps():
-    if _FONT_CMAPS: return
+try:
+    import fontdata
+    _EMBED_OK = list(EMBED_ORDER)
+except Exception as e:
+    fontdata = None
+    _FONT_ERR.append(f"fontdata import failed: {e}")
+
+def _load_folder_cmaps():
+    if _FOLDER_CMAPS or not os.path.isdir(FONT_DIR): return
     try:
         from fontTools.ttLib import TTFont
     except Exception as e:
-        _FONT_ERR.append(f"fonttools import failed: {e}"); return
-    for fn in FONT_FILES:
+        _FONT_ERR.append(f"fonttools import failed (folder fonts skipped): {e}"); return
+    for fn in FOLDER_FILES:
         p = os.path.join(FONT_DIR, fn)
         if os.path.exists(p):
-            try: _FONT_CMAPS[fn] = set(TTFont(p, lazy=True).getBestCmap().keys())
+            try: _FOLDER_CMAPS[fn] = set(TTFont(p, lazy=True).getBestCmap().keys())
             except Exception as e: _FONT_ERR.append(f"{fn}: {e}")
 
 def fonts_status():
-    """ডিবাগ: ফন্ট ফোল্ডার/ফাইল/fonttools ঠিক আছে কি না"""
-    _load_cmaps()
-    return {"fonts_dir": FONT_DIR, "dir_exists": os.path.isdir(FONT_DIR),
-            "loaded": sorted(_FONT_CMAPS), "missing_files": [f for f in FONT_FILES if not os.path.exists(os.path.join(FONT_DIR, f))],
-            "errors": _FONT_ERR, "fallback_mode": not _FONT_CMAPS}
+    """ডিবাগ: এমবেডেড ফন্ট ও (থাকলে) fonts/ ফোল্ডারের অবস্থা"""
+    _load_folder_cmaps()
+    return {"embedded_loaded": list(_EMBED_OK), "folder_exists": os.path.isdir(FONT_DIR), "folder_loaded": sorted(_FOLDER_CMAPS),
+            "errors": _FONT_ERR, "fallback_mode": not _EMBED_OK and not _FOLDER_CMAPS}
 
-def _font_obj(fn, size):
-    key = (fn, size)
-    if key not in _FONT_OBJS:
+def _font_obj(key, size):
+    k = (key, size)
+    if k not in _FONT_OBJS:
         if len(_FONT_OBJS) > 200: _FONT_OBJS.clear()
-        _FONT_OBJS[key] = ImageFont.truetype(os.path.join(FONT_DIR, fn), size)
-    return _FONT_OBJS[key]
+        if key in EMBED_ORDER:
+            _FONT_OBJS[k] = ImageFont.truetype(io.BytesIO(fontdata.font_bytes(key)), size)
+        else:
+            _FONT_OBJS[k] = ImageFont.truetype(os.path.join(FONT_DIR, key), size)
+    return _FONT_OBJS[k]
 
 def pick_font(ch):
-    _load_cmaps()
     cp = ord(ch)
-    for fn in FONT_FILES:
-        if cp in _FONT_CMAPS.get(fn, ()): return fn
+    for key in _EMBED_OK:
+        if fontdata.covers(key, cp): return key
+    _load_folder_cmaps()
+    for fn in FOLDER_FILES:
+        if cp in _FOLDER_CMAPS.get(fn, ()): return fn
     return None
 
 def font(size):
-    try: return _font_obj("DejaVuSans-Bold.ttf", size)
-    except Exception:
-        try: return ImageFont.load_default(size)
-        except TypeError: return ImageFont.load_default()
+    for key in (_EMBED_OK[:1] or []):
+        try: return _font_obj(key, size)
+        except Exception as e: _FONT_ERR.append(str(e))
+    try: return ImageFont.load_default(size)
+    except TypeError: return ImageFont.load_default()
 
 def describe(text):
     """ডিবাগ: প্রতিটি অক্ষরের কোডপয়েন্ট + কোন ফন্টে আছে"""
@@ -78,20 +92,21 @@ def describe(text):
 
 def _runs(text, size):
     runs, x = [], 0.0
+    have_any = bool(_EMBED_OK or _FOLDER_CMAPS)
     for ch in str(text or ""):
         cp = ord(ch)
         if cp in BLANKS:
             runs.append((ch, None, x)); x += size * 0.36; continue
         fn = pick_font(ch)
         if not fn:
-            if _FONT_CMAPS:
-                continue  # ফন্ট আছে কিন্তু এই অক্ষরের গ্লিফ নেই — বক্স না এঁকে বাদ
-            if cp > 127:
-                continue  # ফন্ট ফাইলই নেই: শুধু ASCII আঁকা হবে (নাম পুরো গায়েব হবে না)
+            if have_any or cp > 127:
+                continue  # এই অক্ষরের গ্লিফ কোনো ফন্টেই নেই — বক্স না এঁকে বাদ
             try: f = ImageFont.load_default(size)
             except TypeError: f = ImageFont.load_default()
         else:
-            f = _font_obj(fn, size)
+            try: f = _font_obj(fn, size)
+            except Exception as e:
+                _FONT_ERR.append(str(e)); continue
         runs.append((ch, f, x)); x += f.getlength(ch)
     return runs, x
 

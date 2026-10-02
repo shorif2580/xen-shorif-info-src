@@ -19,24 +19,76 @@ ICON_SOURCES = [
 _ICON_CACHE = {}
 _POOL = ThreadPoolExecutor(max_workers=10)
 
-SMALLCAPS = dict(zip("ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡʏᴢ", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"))
-FONT_PATHS = [
-    os.path.join(os.path.dirname(__file__), "font.ttf"),  # চাইলে নিজের .ttf এখানে রাখুন
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-    "DejaVuSans-Bold.ttf", "arialbd.ttf",
-]
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
+# প্রতিটি অক্ষরের জন্য প্রথম যে ফন্টে গ্লিফ আছে সেটা ব্যবহার হয় (ফলব্যাক চেইন)
+FONT_FILES = ["DejaVuSans-Bold.ttf", "FreeSerifBold.ttf", "FreeSerif.ttf", "unifont.otf", "unifont_upper.otf"]
+# অদৃশ্য/ফাঁকা অক্ষর (গেমের নামে ফাঁক বোঝাতে ব্যবহার হয়) — বক্স না দেখিয়ে স্পেস ধরা হবে
+BLANKS = {0x3164, 0x2800, 0x115F, 0x1160, 0xFFA0, 0x200B, 0x200C, 0x200D, 0x2060, 0xFEFF, 0x00A0, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200A, 0x202F, 0x205F, 0x3000}
+
+_FONT_CMAPS = {}
+_FONT_OBJS = {}
+
+def _load_cmaps():
+    if _FONT_CMAPS: return
+    from fontTools.ttLib import TTFont
+    for fn in FONT_FILES:
+        p = os.path.join(FONT_DIR, fn)
+        if os.path.exists(p):
+            try: _FONT_CMAPS[fn] = set(TTFont(p, lazy=True).getBestCmap().keys())
+            except Exception: pass
+
+def _font_obj(fn, size):
+    key = (fn, size)
+    if key not in _FONT_OBJS:
+        if len(_FONT_OBJS) > 200: _FONT_OBJS.clear()
+        _FONT_OBJS[key] = ImageFont.truetype(os.path.join(FONT_DIR, fn), size)
+    return _FONT_OBJS[key]
+
+def pick_font(ch):
+    _load_cmaps()
+    cp = ord(ch)
+    for fn in FONT_FILES:
+        if cp in _FONT_CMAPS.get(fn, ()): return fn
+    return None
 
 def font(size):
-    for p in FONT_PATHS:
-        try: return ImageFont.truetype(p, size)
-        except Exception: pass
-    try: return ImageFont.load_default(size)
-    except TypeError: return ImageFont.load_default()
+    try: return _font_obj("DejaVuSans-Bold.ttf", size)
+    except Exception:
+        try: return ImageFont.load_default(size)
+        except TypeError: return ImageFont.load_default()
 
-def clean(text):
-    t = unicodedata.normalize("NFKC", str(text or ""))
-    return "".join(SMALLCAPS.get(c, c) for c in t).strip()
+def describe(text):
+    """ডিবাগ: প্রতিটি অক্ষরের কোডপয়েন্ট + কোন ফন্টে আছে"""
+    out = []
+    for ch in str(text or ""):
+        out.append({"char": ch, "code": f"U+{ord(ch):04X}", "blank": ord(ch) in BLANKS, "font": None if ord(ch) in BLANKS else pick_font(ch)})
+    return out
+
+def _runs(text, size):
+    runs, x = [], 0.0
+    for ch in str(text or ""):
+        cp = ord(ch)
+        if cp in BLANKS:
+            runs.append((ch, None, x)); x += size * 0.36; continue
+        fn = pick_font(ch)
+        if not fn:
+            continue  # কোনো ফন্টেই নেই — বক্স না এঁকে বাদ
+        f = _font_obj(fn, size)
+        runs.append((ch, f, x)); x += f.getlength(ch)
+    return runs, x
+
+def draw_text(d, xy, text, size, fill, stroke=0, anchor="l", max_width=None):
+    """baseline-এ টেক্সট আঁকে; anchor: l/m/r; max_width দিলে ফন্ট ছোট করে ফিট করে"""
+    runs, width = _runs(text, size)
+    while max_width and width > max_width and size > 22:
+        size -= 2; runs, width = _runs(text, size)
+    x0, y = xy
+    if anchor == "m": x0 -= width / 2
+    elif anchor == "r": x0 -= width
+    for ch, f, dx in runs:
+        if f is None: continue
+        d.text((x0 + dx, y), ch, font=f, fill=fill, anchor="ls", stroke_width=stroke, stroke_fill=(0, 0, 0, 255))
+    return width
 
 def fetch_icon(item_id):
     """আইটেম আইকন (RGBA) বা None"""
@@ -64,9 +116,6 @@ def cover(img, w, h):
     im = img.resize((max(1, int(img.width * s)), max(1, int(img.height * s))), Image.LANCZOS)
     l, t = (im.width - w) // 2, (im.height - h) // 2
     return im.crop((l, t, l + w, t + h))
-
-def stroke_text(d, xy, text, f, fill, stroke=4, anchor="la"):
-    d.text(xy, text, font=f, fill=fill, stroke_width=stroke, stroke_fill=(0, 0, 0, 255), anchor=anchor)
 
 def to_png(img):
     b = io.BytesIO(); img.convert("RGB").save(b, "PNG", optimize=True); return b.getvalue()
@@ -107,9 +156,9 @@ def banner_image(data):
         p = pin.resize((84, 84), Image.LANCZOS); canvas.alpha_composite(p, (8, H - 92))
 
     x0 = H + 40
-    stroke_text(d, (x0, 38), clean(b.get("nickname")) or "Player", font(78), (255, 255, 255, 255), 5)
-    guild = clean(c.get("clanName"))
-    if guild: stroke_text(d, (x0, 150), guild, font(54), (255, 70, 70, 255), 4)
+    draw_text(d, (x0, 118), b.get("nickname") or "Player", 78, (255, 255, 255, 255), 5, "l", W - x0 - 40)
+    guild = c.get("clanName")
+    if guild: draw_text(d, (x0, 205), guild, 54, (255, 70, 70, 255), 4, "l", W - x0 - 40)
     # লেভেল
     lv = f"Lv.{b.get('level', 0)}"
     f = font(44); tw = d.textlength(lv, font=f)
@@ -179,6 +228,6 @@ def outfit_image(data):
                 canvas.paste(layer, (0, 0), m)
         d.polygon(poly, outline=(170, 130, 255, 255), width=5)
 
-    stroke_text(d, (W // 2, 60), clean(b.get("nickname")) or "Player", font(56), (255, 255, 255, 255), 4, "mm")
-    stroke_text(d, (W // 2, 120), f"Lv.{b.get('level', 0)}  •  UID {b.get('accountId', '')}", font(30), (210, 190, 255, 255), 3, "mm")
+    draw_text(d, (W // 2, 78), b.get("nickname") or "Player", 56, (255, 255, 255, 255), 4, "m", W - 120)
+    draw_text(d, (W // 2, 130), f"Lv.{b.get('level', 0)}  •  UID {b.get('accountId', '')}", 30, (210, 190, 255, 255), 3, "m")
     return to_png(canvas)

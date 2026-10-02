@@ -25,30 +25,35 @@ CORS(app)
 # 📂 ACCOUNTS LOADER (accounts.json ফাইল থেকে স্বয়ংক্রিয়ভাবে লোড হবে)
 # ==============================================================================
 def load_accounts_config():
-    acc_file = os.path.join(os.path.dirname(__file__), "accounts.json")
-    if os.path.exists(acc_file):
+    """সার্ভার অনুযায়ী আলাদা JSON ফাইল: account_bd.json / account_ind.json / account_global.json
+       ফরম্যাট: [{"uid": "...", "password": "..."}, ...]
+       (ঐচ্ছিক) ACCOUNTS_JSON environment variable দিয়ে পুরো কনফিগ ওভাররাইড করা যায়।"""
+    env_json = os.environ.get("ACCOUNTS_JSON", "").strip()
+    if env_json:
+        try: return json.loads(env_json)
+        except Exception: pass
+    base = os.path.dirname(os.path.abspath(__file__))
+    cfg = {}
+    for key in ("BD", "IND", "GLOBAL"):
+        path = os.path.join(base, f"account_{key.lower()}.json")
         try:
-            with open(acc_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cfg[key] = [{"uid": str(c["uid"]), "password": str(c["password"])} for c in data if isinstance(c, dict) and c.get("uid") and c.get("password")]
         except Exception:
-            pass
-    # ফলব্যাক ডিফল্ট
-    return {
-        "BD": [
-            {"uid": "7965111855", "password": "45FD22E8730EF6F9863343DCA572FABA050B544721101D88C8CE4570DB849086"},
-            {"uid": "7966603004", "password": "1B3DF4391F1932B786A74881C8EADD58770F5141BFD70356D0FE6864BDDC6C96"},
-            {"uid": "7967157776", "password": "A91C5BD673E6EFCB1CF22FC0B2E542CD15D329E58C5A2B1768E39BB9732D64FE"}
-        ],
-        "IND": [{"uid": "4363983977", "password": "ISHITA_0AFN5_BY_SPIDEERIO_GAMING_UY12H"}],
-        "GLOBAL": [{"uid": "4682784982", "password": "GHOST_TNVW1_RIZER_QTFT0"}]
-    }
+            cfg[key] = []
+    return cfg
 
 ACCOUNTS_CONFIG = load_accounts_config()
-bd_cycle = itertools.cycle(ACCOUNTS_CONFIG.get("BD", []))
 cached_tokens = {}
 uid_region_cache = {}
+bad_accounts = {}          # guest_uid -> cooldown শেষ হওয়ার সময়
+COOLDOWN_SECONDS = 120
+TOKEN_API_URL = os.environ.get("TOKEN_API_URL", "https://flash-token-v2.vercel.app/token")
+TOKEN_API_KEY = os.environ.get("TOKEN_API_KEY", "Flash")
+_rr = itertools.count()
 
-# ক্রিপ্টোগ্রাফি হেল্পার
+# Crypto helpers
 def pad(text: bytes) -> bytes:
     n = AES.block_size - (len(text) % AES.block_size)
     return text + bytes([n] * n)
@@ -62,84 +67,93 @@ def decode_protobuf(data: bytes, msg_type):
     return inst
 
 # 🌟 প্রতি রিকোয়েস্টে আলাদা গেস্ট আইডি নির্বাচন (Rotation)
-def get_next_credentials(region: str) -> dict:
+# 🌟 রিজিয়ন অনুযায়ী গেস্ট লিস্ট
+def accounts_for(region: str) -> list:
     r = region.upper()
-    if r == "IND":
-        ind_list = ACCOUNTS_CONFIG.get("IND", [])
-        return ind_list[0] if ind_list else {"uid": "4363983977", "password": ""}
-    elif r in {"BR", "US", "SAC", "NA"}:
-        glob_list = ACCOUNTS_CONFIG.get("GLOBAL", [])
-        return glob_list[0] if glob_list else {"uid": "4682784982", "password": ""}
-    else:
-        return next(bd_cycle)
+    key = "IND" if r == "IND" else ("GLOBAL" if r in {"BR", "US", "SAC", "NA"} else "BD")
+    return [c for c in ACCOUNTS_CONFIG.get(key, []) if c.get("uid") and c.get("password")]
 
-def get_token_info(region: str):
-    cred = get_next_credentials(region)
-    guest_uid = cred["uid"]
-    guest_pwd = cred["password"]
+def mark_bad(guest_uid: str):
+    bad_accounts[guest_uid] = time.time() + COOLDOWN_SECONDS
+    cached_tokens.pop(guest_uid, None)
 
+def ordered_accounts(region: str) -> list:
+    """রাউন্ড-রবিন + খারাপ আইডি সাময়িক বাদ (সব খারাপ হলে সবগুলোই আবার চেষ্টা)"""
+    lst = accounts_for(region)
+    if not lst: return []
+    s = next(_rr) % len(lst)
+    lst = lst[s:] + lst[:s]
     now = time.time()
-    if guest_uid in cached_tokens and now < cached_tokens[guest_uid].get('expires_at', 0) - 60:
-        info = cached_tokens[guest_uid]
-        return info['token'], info['region'], info['server_url']
+    return [c for c in lst if bad_accounts.get(c["uid"], 0) <= now] or lst
 
+def request_token(cred: dict, region: str):
+    """একটি গেস্ট আইডির টোকেন (ক্যাশ বা নতুন); ব্যর্থ হলে None"""
+    uid_g, pwd = cred["uid"], cred["password"]
+    now = time.time()
+    c = cached_tokens.get(uid_g)
+    if c and now < c.get("expires_at", 0) - 60:
+        return c
     try:
-        token_api = "https://flash-token-v2.vercel.app/token"
-        params = {"uid": guest_uid, "password": guest_pwd, "key": "Flash"}
         headers = {"User-Agent": USERAGENT, "Accept": "application/json"}
-        
         with httpx.Client(timeout=8.0, verify=False) as client:
-            resp = client.get(token_api, params=params, headers=headers)
-            if resp.status_code == 200:
-                msg = resp.json()
-                raw_token = msg.get('token', '')
-                bearer_token = raw_token if raw_token.startswith("Bearer ") else f"Bearer {raw_token}"
-                
-                cached_tokens[guest_uid] = {
-                    'token': bearer_token,
-                    'region': msg.get('lockRegion') or msg.get('region') or region,
-                    'server_url': msg.get('serverUrl', 'https://clientbp.ppmainecoonghj.com'),
-                    'expires_at': msg.get('expiry_time', now + 25200)
+            resp = client.get(TOKEN_API_URL, params={"uid": uid_g, "password": pwd, "key": TOKEN_API_KEY}, headers=headers)
+        if resp.status_code == 200:
+            msg = resp.json()
+            raw = msg.get("token", "")
+            if raw:
+                cached_tokens[uid_g] = {
+                    "token": raw if raw.startswith("Bearer ") else f"Bearer {raw}",
+                    "region": msg.get("lockRegion") or msg.get("region") or region,
+                    "server_url": msg.get("serverUrl", "https://clientbp.ppmainecoonghj.com"),
+                    "expires_at": msg.get("expiry_time", now + 25200),
                 }
-                return cached_tokens[guest_uid]['token'], cached_tokens[guest_uid]['region'], cached_tokens[guest_uid]['server_url']
+                return cached_tokens[uid_g]
     except Exception as e:
-        app.logger.error(f"Token generation failed for {guest_uid}: {e}")
-
-    return None, region, "https://clientbp.ppmainecoonghj.com"
+        app.logger.error(f"Token generation failed for {uid_g[:3]}***: {e}")
+    return None
 
 def fetch_player_data(uid: str, region: str = "BD"):
-    token, lock_reg, server = get_token_info(region)
-    if not token:
-        raise Exception(f"Failed to obtain token for region {region}")
-
-    req = main_pb2.GetPlayerPersonalShow()
-    json_format.ParseDict({'a': int(uid), 'b': 7}, req)
-    data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, req.SerializeToString())
-
-    headers = {
-        'User-Agent': USERAGENT,
-        'Connection': "Keep-Alive",
-        'Accept-Encoding': "gzip",
-        'Content-Type': "application/octet-stream",
-        'Authorization': token,
-        'X-Unity-Version': "2018.4.11f1",
-        'X-GA': "v1 1",
-        'ReleaseVersion': RELEASEVERSION
-    }
-
-    url = server.rstrip('/') + "/GetPlayerPersonalShow"
-    with httpx.Client(timeout=10.0, verify=False) as client:
-        resp = client.post(url, content=data_enc, headers=headers)
+    pool = ordered_accounts(region)
+    if not pool:
+        raise Exception(f"No guest accounts configured for {region} (account_*.json ফাইল দেখুন)")
+    last_err = "no response"
+    for cred in pool[:4]:
+        info = request_token(cred, region)
+        if not info:
+            mark_bad(cred["uid"]); last_err = "token generation failed"; continue
+        req = main_pb2.GetPlayerPersonalShow()
+        json_format.ParseDict({'a': int(uid), 'b': 7}, req)
+        data_enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, req.SerializeToString())
+        headers = {
+            'User-Agent': USERAGENT, 'Connection': "Keep-Alive", 'Accept-Encoding': "gzip",
+            'Content-Type': "application/octet-stream", 'Authorization': info["token"],
+            'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION
+        }
+        url = info["server_url"].rstrip('/') + "/GetPlayerPersonalShow"
+        try:
+            with httpx.Client(timeout=10.0, verify=False) as client:
+                resp = client.post(url, content=data_enc, headers=headers)
+        except Exception as e:
+            last_err = str(e); continue
         if resp.status_code == 200:
-            proto_obj = decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)
-            return json.loads(json_format.MessageToJson(proto_obj))
-        else:
-            raise Exception(f"Garena responded: {resp.status_code}")
+            try:
+                data = json.loads(json_format.MessageToJson(decode_protobuf(resp.content, AccountPersonalShow_pb2.AccountPersonalShowInfo)))
+            except Exception:
+                last_err = "decode error"; continue
+            if data.get("basicInfo") or data.get("basic_info"):
+                return data
+            last_err = "empty response"; continue      # আইডি ব্যান/UID নেই — পরেরটা দিয়ে দেখি (কুলডাউন নয়)
+        if resp.status_code in (401, 403):
+            mark_bad(cred["uid"]); last_err = f"Garena {resp.status_code}"; continue
+        last_err = f"Garena {resp.status_code}"
+    raise Exception(f"Failed for region {region}: {last_err}")
 
+POOLS = ["BD", "IND", "BR"]   # BD পুল, IND পুল, GLOBAL পুল (BR লেবেল)
 
 def get_player_data(uid: str):
-    """UID-র ডেটা খুঁজে আনে (ক্যাশ করা রিজিয়ন আগে, তারপর বাকিগুলো)"""
-    order = ([uid_region_cache[uid]] if uid in uid_region_cache else []) + [r for r in SUPPORTED_REGIONS if r != uid_region_cache.get(uid)]
+    """UID-র ডেটা খুঁজে আনে (ক্যাশ করা পুল আগে)"""
+    cached = uid_region_cache.get(uid)
+    order = ([cached] if cached else []) + [p for p in POOLS if p != cached]
     for region in order:
         try:
             data = fetch_player_data(uid, region)
@@ -184,10 +198,10 @@ def root_index():
         "status": "Online",
         "service": "Xen Shorif Master Free Fire API",
         "developer": "@xen_shorif",
-        "accounts_config": "accounts.json (Active)",
+        "accounts_config": "account_bd.json / account_ind.json / account_global.json",
         "endpoints": {
             "player_info": "/player-info?uid=YOUR_UID",
-            "banner": "/banner?uid=YOUR_UID",
+            "banner": "/banner?uid=YOUR_UID  (&debug=1 → নামের অক্ষর-কোড)",
             "outfit": "/outfit?uid=YOUR_UID",
             "br_stats": "/stats/br?uid=YOUR_UID&mode=RANKED",
             "cs_stats": "/stats/cs?uid=YOUR_UID&mode=RANKED",
@@ -196,29 +210,39 @@ def root_index():
         }
     })
 
+# 0. 🩺 GUEST ACCOUNT HEALTH  (/accounts-status  বা  ?test=1 দিয়ে লাইভ টেস্ট)
+@app.route('/accounts-status', methods=['GET'])
+def accounts_status():
+    admin = os.environ.get("ADMIN_KEY", "")
+    if admin and request.args.get("key") != admin:
+        return jsonify({"error": "unauthorized"}), 401
+    live = request.args.get("test") == "1"
+    mask = lambda u: (u[:3] + "****" + u[-3:]) if len(u) > 6 else "***"
+    now = time.time()
+    out = {}
+    for group, lst in ACCOUNTS_CONFIG.items():
+        rows = []
+        for c in lst:
+            u = str(c.get("uid", ""))
+            row = {"uid": mask(u), "cooldown_s": max(0, int(bad_accounts.get(u, 0) - now)),
+                   "token_cached": bool(cached_tokens.get(u) and now < cached_tokens[u].get("expires_at", 0))}
+            if live:
+                row["token_ok"] = request_token(c, group) is not None
+                if not row["token_ok"]: mark_bad(u)
+            rows.append(row)
+        out[group] = rows
+    return jsonify({"token_api": TOKEN_API_URL.split("/token")[0], "accounts": out})
+
 # 1. PLAYER INFO ROUTE
 @app.route('/player-info', methods=['GET'])
 def get_account_info():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit():
         return jsonify({"error": "Please provide a valid numeric UID."}), 400
-
-    if uid in uid_region_cache:
-        try:
-            data = fetch_player_data(uid, uid_region_cache[uid])
-            if data and (data.get("basicInfo") or data.get("basic_info")):
-                return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
-        except Exception: pass
-
-    for region in SUPPORTED_REGIONS:
-        try:
-            data = fetch_player_data(uid, region)
-            if data and (data.get("basicInfo") or data.get("basic_info")):
-                uid_region_cache[uid] = region
-                return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
-        except Exception: continue
-
-    return jsonify({"error": "UID not found in any region."}), 404
+    data = get_player_data(uid)
+    if not data:
+        return jsonify({"error": "UID not found or guest accounts unavailable."}), 404
+    return json.dumps(data, indent=2, ensure_ascii=False), 200, {'Content-Type': 'application/json; charset=utf-8'}
 
 # 2. 🖼️ BANNER ROUTE (নিজস্ব জেনারেটর — Flash API লাগে না)
 @app.route('/banner', methods=['GET'])
@@ -229,6 +253,9 @@ def get_banner_image():
     data = get_player_data(uid)
     if not data:
         return jsonify({"error": "UID not found in any region."}), 404
+    if request.args.get("debug"):
+        b, c = data.get("basicInfo") or {}, data.get("clanBasicInfo") or {}
+        return jsonify({"nickname": imagegen.describe(b.get("nickname")), "clan": imagegen.describe(c.get("clanName"))})
     try:
         return png_response(imagegen.banner_image(data))
     except Exception as e:
@@ -276,142 +303,86 @@ def get_ban_status():
             "ban_status": ban_status,
             "period": "Permanent" if is_deleted else "None"
         })
-    except Exception:
-        return jsonify({
-            "Nickname": "Player",
-            "UID": uid,
-            "Region": "BD",
-            "level": "N/A",
-            "is_banned": False,
-            "ban_status": "Clean"
-        })
+    except Exception as e:
+        return jsonify({"error": f"Ban status unavailable: {e}"}), 502
 
-# 5. 🏆 ADVANCED BR STATS ROUTE
-@app.route('/stats/br', methods=['GET'])
-def get_br_stats():
-    uid = request.args.get('uid')
-    mode = request.args.get('mode', 'RANKED').upper()
-    if not uid: return jsonify({"error": "UID is required"}), 400
+# ==============================================================================
+# 📊 STATS (সোর্স: flash-player-info-v1 — আমাদের প্রোটো ফাইলে stats মেসেজ নেই)
+# ⚠️ সোর্স না পেলে নকল/হার্ডকোড ডেটা দেওয়া হয় না — 502 এরর ফেরত যায়
+# ==============================================================================
+STATS_UPSTREAM = os.environ.get("STATS_API_URL", "https://flash-player-info-v1.vercel.app/stats").rstrip("/")
 
-    match_mode = "RANKED" if mode == "RANKED" else "CAREER"
-    url = f"https://flash-player-info-v1.vercel.app/stats/{match_mode}/br?uid={uid}"
-    headers = {"User-Agent": USERAGENT, "Accept": "application/json"}
-    
-    raw = None
-    try:
-        with httpx.Client(timeout=4.0, verify=False) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 200:
-                raw = resp.json()
-    except: pass
-
-    if not raw:
+def fetch_stats_raw(uid, match_mode, kind):
+    last = None
+    for timeout in (6.0, 4.0):
         try:
-            p_data = fetch_player_data(uid, "BD")
-            b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
-            raw = {
-                "nickname": b.get("nickname", "Xen Shorif"),
-                "quadstats": {"gamesplayed": 78, "wins": 10, "kills": 244, "detailedstats": {"damage": 78400, "deaths": 68, "headshots": 54, "highestKills": 15}},
-                "duostats": {"gamesplayed": 5, "wins": 0, "kills": 7, "detailedstats": {"damage": 3824, "deaths": 5, "headshots": 4, "highestKills": 4}},
-                "solostats": {"gamesplayed": 2, "wins": 0, "kills": 6, "detailedstats": {"damage": 1095, "deaths": 2, "headshots": 1, "highestKills": 6}}
-            }
-        except:
-            raw = {}
+            with httpx.Client(timeout=timeout, verify=False) as client:
+                r = client.get(f"{STATS_UPSTREAM}/{match_mode}/{kind}", params={"uid": uid}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, dict) and d: return d
+        except Exception as e:
+            last = e
+    return None
 
-    quad = calculate_br_mode(raw.get("quadstats", {}))
-    duo = calculate_br_mode(raw.get("duostats", {}))
-    solo = calculate_br_mode(raw.get("solostats", {}))
+def build_br(uid, match_mode):
+    raw = fetch_stats_raw(uid, match_mode, "br")
+    if raw is None: return None
+    sq, du, so = (calculate_br_mode(raw.get(k) or {}) for k in ("quadstats", "duostats", "solostats"))
+    return {"uid": uid, "nickname": raw.get("nickname"), "mode": match_mode, "squad": sq, "duo": du, "solo": so,
+            "has_data": any(x["games_played"] > 0 for x in (sq, du, so))}
 
-    return jsonify({
-        "uid": uid,
-        "nickname": raw.get("nickname", "Player"),
-        "mode": match_mode,
-        "squad": quad,
-        "duo": duo,
-        "solo": solo
-    })
-
-# 6. ⚔️ ADVANCED CS STATS ROUTE
-@app.route('/stats/cs', methods=['GET'])
-def get_cs_stats():
-    uid = request.args.get('uid')
-    mode = request.args.get('mode', 'RANKED').upper()
-    if not uid: return jsonify({"error": "UID is required"}), 400
-
-    match_mode = "RANKED" if mode == "RANKED" else "CAREER"
-    url = f"https://flash-player-info-v1.vercel.app/stats/{match_mode}/cs?uid={uid}"
-    headers = {"User-Agent": USERAGENT, "Accept": "application/json"}
-    
-    raw = None
-    try:
-        with httpx.Client(timeout=4.0, verify=False) as client:
-            resp = client.get(url, headers=headers)
-            if resp.status_code == 200:
-                raw = resp.json()
-    except: pass
-
-    if not raw:
-        try:
-            p_data = fetch_player_data(uid, "BD")
-            b = p_data.get("basicInfo") or p_data.get("basicinfo") or {}
-            raw = {
-                "nickname": b.get("nickname", "Xen Shorif"),
-                "csstats": {
-                    "gamesplayed": 42, "wins": 31, "kills": 208,
-                    "detailedstats": {
-                        "damage": 81746, "deaths": 96, "assists": 95, "headShotKills": 59, "mvpCount": 18,
-                        "doubleKills": 35, "tripleKills": 15, "fourKills": 7
-                    }
-                }
-            }
-        except:
-            raw = {}
-
-    cs = raw.get("csstats", {})
-    det = cs.get("detailedstats", {})
-    played = cs.get('gamesplayed', 0) or 0
-    wins = cs.get('wins', 0) or 0
-    kills = cs.get('kills', 0) or 0
-    deaths = det.get('deaths', 0) or 0
-    assists = det.get('assists', 0) or 0
-    hs = det.get('headShotKills', det.get('headshots', 0)) or 0
-
+def build_cs(uid, match_mode):
+    raw = fetch_stats_raw(uid, match_mode, "cs")
+    if raw is None: return None
+    cs = raw.get("csstats") or {}
+    det = cs.get("detailedstats") or {}
+    played, wins, kills = cs.get("gamesplayed", 0) or 0, cs.get("wins", 0) or 0, cs.get("kills", 0) or 0
+    deaths, assists = det.get("deaths", 0) or 0, det.get("assists", 0) or 0
+    hs = det.get("headShotKills", det.get("headshots", 0)) or 0
     kda = round((kills + assists) / deaths, 2) if deaths > 0 else float(kills + assists)
     kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
-    hs_rate = round((hs / kills) * 100, 2) if kills > 0 else 0.0
-    win_rate = round((wins / played) * 100, 2) if played > 0 else 0.0
-
-    return jsonify({
-        "uid": uid,
-        "nickname": raw.get("nickname", "Player"),
-        "mode": match_mode,
-        "matches": played,
-        "wins": wins,
-        "win_rate": f"{win_rate}%",
-        "kills": kills,
-        "deaths": deaths,
-        "assists": assists,
-        "kd_ratio": kd,
-        "official_kda": kda,
-        "headshot_kills": hs,
-        "headshot_rate": f"{hs_rate}%",
-        "damage": det.get('damage', 0) or 0,
-        "mvp": det.get("mvpCount", 0) or 0,
-        "double_kills": det.get("doubleKills", 0) or 0,
-        "triple_kills": det.get("tripleKills", 0) or 0,
+    return {
+        "uid": uid, "nickname": raw.get("nickname"), "mode": match_mode, "has_data": played > 0,
+        "matches": played, "wins": wins, "win_rate": f"{round(wins / played * 100, 2) if played else 0.0}%",
+        "kills": kills, "deaths": deaths, "assists": assists, "kd_ratio": kd, "official_kda": kda,
+        "headshot_kills": hs, "headshot_rate": f"{round(hs / kills * 100, 2) if kills else 0.0}%",
+        "damage": det.get("damage", 0) or 0, "mvp": det.get("mvpCount", 0) or 0,
+        "double_kills": det.get("doubleKills", 0) or 0, "triple_kills": det.get("tripleKills", 0) or 0,
         "quadra_kills": det.get("fourKills", 0) or 0
-    })
+    }
 
-# 7. ALL-IN-ONE STATS ROUTE
+def stats_route(builder):
+    uid = request.args.get('uid')
+    mode = request.args.get('mode', 'RANKED').upper()
+    if not uid or not uid.isdigit(): return jsonify({"error": "Numeric UID is required"}), 400
+    match_mode = "RANKED" if mode == "RANKED" else "CAREER"
+    res = builder(uid, match_mode)
+    if res is None:
+        return jsonify({"error": "Stats source unavailable. Please try again.", "uid": uid, "mode": match_mode}), 502
+    return jsonify(res)
+
+# 5. 🏆 BR STATS
+@app.route('/stats/br', methods=['GET'])
+def get_br_stats(): return stats_route(build_br)
+
+# 6. ⚔️ CS STATS
+@app.route('/stats/cs', methods=['GET'])
+def get_cs_stats(): return stats_route(build_cs)
+
+# 7. 📊 ALL-IN-ONE (BR+CS, RANKED+CAREER একসাথে, সমান্তরালে)
 @app.route('/stats/all', methods=['GET'])
 def get_all_stats():
     uid = request.args.get('uid')
-    if not uid: return jsonify({"error": "UID is required"}), 400
-    return jsonify({
-        "uid": uid,
-        "br_ranked": get_br_stats().get_json(),
-        "cs_ranked": get_cs_stats().get_json()
-    })
+    if not uid or not uid.isdigit(): return jsonify({"error": "Numeric UID is required"}), 400
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {"br_ranked": (build_br, "RANKED"), "br_career": (build_br, "CAREER"), "cs_ranked": (build_cs, "RANKED"), "cs_career": (build_cs, "CAREER")}
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {k: ex.submit(fn, uid, m) for k, (fn, m) in jobs.items()}
+        out = {k: f.result() for k, f in futs.items()}
+    out["uid"] = uid
+    out["errors"] = [k for k, v in out.items() if k != "uid" and v is None]
+    return jsonify(out)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

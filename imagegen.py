@@ -28,14 +28,26 @@ BLANKS = {0x3164, 0x2800, 0x115F, 0x1160, 0xFFA0, 0x200B, 0x200C, 0x200D, 0x2060
 _FONT_CMAPS = {}
 _FONT_OBJS = {}
 
+_FONT_ERR = []
+
 def _load_cmaps():
     if _FONT_CMAPS: return
-    from fontTools.ttLib import TTFont
+    try:
+        from fontTools.ttLib import TTFont
+    except Exception as e:
+        _FONT_ERR.append(f"fonttools import failed: {e}"); return
     for fn in FONT_FILES:
         p = os.path.join(FONT_DIR, fn)
         if os.path.exists(p):
             try: _FONT_CMAPS[fn] = set(TTFont(p, lazy=True).getBestCmap().keys())
-            except Exception: pass
+            except Exception as e: _FONT_ERR.append(f"{fn}: {e}")
+
+def fonts_status():
+    """ডিবাগ: ফন্ট ফোল্ডার/ফাইল/fonttools ঠিক আছে কি না"""
+    _load_cmaps()
+    return {"fonts_dir": FONT_DIR, "dir_exists": os.path.isdir(FONT_DIR),
+            "loaded": sorted(_FONT_CMAPS), "missing_files": [f for f in FONT_FILES if not os.path.exists(os.path.join(FONT_DIR, f))],
+            "errors": _FONT_ERR, "fallback_mode": not _FONT_CMAPS}
 
 def _font_obj(fn, size):
     key = (fn, size)
@@ -72,8 +84,14 @@ def _runs(text, size):
             runs.append((ch, None, x)); x += size * 0.36; continue
         fn = pick_font(ch)
         if not fn:
-            continue  # কোনো ফন্টেই নেই — বক্স না এঁকে বাদ
-        f = _font_obj(fn, size)
+            if _FONT_CMAPS:
+                continue  # ফন্ট আছে কিন্তু এই অক্ষরের গ্লিফ নেই — বক্স না এঁকে বাদ
+            if cp > 127:
+                continue  # ফন্ট ফাইলই নেই: শুধু ASCII আঁকা হবে (নাম পুরো গায়েব হবে না)
+            try: f = ImageFont.load_default(size)
+            except TypeError: f = ImageFont.load_default()
+        else:
+            f = _font_obj(fn, size)
         runs.append((ch, f, x)); x += f.getlength(ch)
     return runs, x
 
@@ -120,8 +138,18 @@ def cover(img, w, h):
 def to_png(img):
     b = io.BytesIO(); img.convert("RGB").save(b, "PNG", optimize=True); return b.getvalue()
 
+def to_webp_sticker(img, width=512):
+    """টেলিগ্রাম স্টিকারের জন্য: প্রস্থ ৫১২ px, WebP (ছবি কেটে যায় না)"""
+    im = img.convert("RGBA")
+    if im.width != width:
+        im = im.resize((width, max(1, round(im.height * width / im.width))), Image.LANCZOS)
+    b = io.BytesIO(); im.save(b, "WEBP", lossless=True, quality=100, method=6); return b.getvalue()
+
+def encode(img, fmt):
+    return to_webp_sticker(img) if fmt == "webp" else to_png(img)
+
 # ---------------------------------------------------------------- BANNER
-def banner_image(data):
+def banner_image(data, fmt="png"):
     b = data.get("basicInfo") or {}
     c = data.get("clanBasicInfo") or {}
     W, H = 1280, 275
@@ -165,7 +193,7 @@ def banner_image(data):
     pad = 16
     d.rounded_rectangle([W - tw - pad * 2 - 14, H - 66, W - 14, H - 14], radius=12, fill=(0, 0, 0, 170))
     d.text((W - tw - pad - 14, H - 40), lv, font=f, fill=(255, 255, 255, 255), anchor="lm")
-    return to_png(canvas)
+    return encode(canvas, fmt)
 
 # ---------------------------------------------------------------- OUTFIT
 def hexagon(cx, cy, r):

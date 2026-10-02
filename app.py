@@ -4,6 +4,7 @@ import httpx
 import json
 import base64
 import itertools
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
 from proto import main_pb2, AccountPersonalShow_pb2
@@ -255,9 +256,13 @@ def get_banner_image():
         return jsonify({"error": "UID not found in any region."}), 404
     if request.args.get("debug"):
         b, c = data.get("basicInfo") or {}, data.get("clanBasicInfo") or {}
-        return jsonify({"nickname": imagegen.describe(b.get("nickname")), "clan": imagegen.describe(c.get("clanName"))})
+        return jsonify({"fonts": imagegen.fonts_status(), "nickname": imagegen.describe(b.get("nickname")), "clan": imagegen.describe(c.get("clanName"))})
     try:
-        return png_response(imagegen.banner_image(data))
+        fmt = "webp" if request.args.get("format", "").lower() == "webp" else "png"
+        png = imagegen.banner_image(data, fmt)
+        if fmt == "webp":
+            return Response(png, mimetype="image/webp", headers={"Cache-Control": "public, max-age=300", "Access-Control-Allow-Origin": "*"})
+        return png_response(png)
     except Exception as e:
         app.logger.error(f"banner error: {e}")
         return jsonify({"error": f"Banner generation failed: {e}"}), 500
@@ -383,6 +388,116 @@ def get_all_stats():
     out["uid"] = uid
     out["errors"] = [k for k, v in out.items() if k != "uid" and v is None]
     return jsonify(out)
+
+
+# ==============================================================================
+# 🔐 TOKEN / DECODE / STATS-PROBE   (ADMIN_KEY সেট থাকলে ?key=... লাগবে)
+# ==============================================================================
+def admin_ok():
+    k = os.environ.get("ADMIN_KEY", "")
+    return (not k) or request.args.get("key") == k
+
+def _fmt_ts(v):
+    try:
+        dt = datetime.fromtimestamp(int(v), timezone.utc)
+        bd = dt + timedelta(hours=6)
+        return {"utc": dt.strftime("%Y-%m-%d %H:%M:%S"), "bd": bd.strftime("%d %B %Y, %I:%M:%S %p"), "seconds_left": int(int(v) - time.time())}
+    except Exception:
+        return None
+
+def _b64url_json(part):
+    part += "=" * (-len(part) % 4)
+    return json.loads(base64.urlsafe_b64decode(part.encode()).decode("utf-8"))
+
+# 8. 🔓 JWT DECODE (সিগনেচার যাচাই করে না — শুধু header/payload পড়ে)
+@app.route('/decode', methods=['GET', 'POST'])
+def decode_token():
+    tok = (request.values.get("token") or "").strip()
+    if tok.lower().startswith("bearer "): tok = tok[7:].strip()
+    parts = tok.split(".")
+    if len(parts) != 3:
+        return jsonify({"error": "এটা JWT নয় (header.payload.signature ফরম্যাট লাগবে)"}), 400
+    try:
+        header, payload = _b64url_json(parts[0]), _b64url_json(parts[1])
+    except Exception as e:
+        return jsonify({"error": f"Decode failed: {e}"}), 400
+    times = {k: _fmt_ts(v) for k, v in payload.items() if isinstance(v, (int, float)) and 1_000_000_000 < v < 4_000_000_000 and k.lower() in ("exp", "iat", "nbf", "expiry", "expire", "created")}
+    return jsonify({"header": header, "payload": payload, "times": {k: v for k, v in times.items() if v}, "signature_verified": False})
+
+# 9. 🎟 TOKEN (আপনার টোকেন সার্ভিস থেকে সরাসরি আসা JSON — ফিল্ডে কোনো পরিবর্তন করা হয় না)
+@app.route('/token', methods=['GET', 'POST'])
+def token_passthrough():
+    if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
+    uid_g, pwd = request.values.get("uid", "").strip(), request.values.get("password", "").strip()
+    if not uid_g.isdigit() or not pwd:
+        return jsonify({"error": "uid (numeric) আর password দিন"}), 400
+    try:
+        with httpx.Client(timeout=12.0, verify=False) as client:
+            r = client.get(TOKEN_API_URL, params={"uid": uid_g, "password": pwd, "key": TOKEN_API_KEY}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
+        data = r.json()
+    except Exception as e:
+        return jsonify({"error": f"Token service unavailable: {e}"}), 502
+    if r.status_code != 200 or not isinstance(data, dict) or not (data.get("token") or data.get("access_token")):
+        return jsonify({"error": "Token generate হয়নি (আইডি/পাসওয়ার্ড ভুল বা ব্যান হতে পারে)", "service_status": r.status_code}), 502
+    return jsonify(data)
+
+# 10. 🧪 STATS PROBE — শুধু ডায়াগনস্টিক। Garena-র স্ট্যাটস রেসপন্সের কাঁচা (স্কিমাহীন) ডিকোড দেখায়।
+#     ⚠️ এন্ডপয়েন্ট নাম/রিকোয়েস্ট ফরম্যাট আমার যাচাই করা নয় — ফলাফল দেখে মিলিয়ে নেওয়ার জন্য।
+def parse_wire(buf, depth=0):
+    out, i = {}, 0
+    def varint(i):
+        r = sh = 0
+        while True:
+            b = buf[i]; i += 1; r |= (b & 0x7F) << sh; sh += 7
+            if not b & 0x80: return r, i
+    while i < len(buf):
+        key, i = varint(i); fn, wt = key >> 3, key & 7
+        if fn == 0: raise ValueError("bad field")
+        if wt == 0: v, i = varint(i)
+        elif wt == 1: v = int.from_bytes(buf[i:i + 8], "little"); i += 8
+        elif wt == 5: v = int.from_bytes(buf[i:i + 4], "little"); i += 4
+        elif wt == 2:
+            ln, i = varint(i); chunk = buf[i:i + ln]; i += ln
+            if len(chunk) != ln: raise ValueError("truncated")
+            try:
+                txt = chunk.decode("utf-8"); v = txt if txt.isprintable() else None
+            except Exception: v = None
+            if v is None and depth < 4:
+                try: v = parse_wire(chunk, depth + 1)
+                except Exception: v = None
+            if v is None or v == {}: v = chunk.hex()
+        else: raise ValueError("bad wiretype")
+        out.setdefault(str(fn), []).append(v)
+    return out
+
+@app.route('/stats-probe', methods=['GET'])
+def stats_probe():
+    if not os.environ.get("ADMIN_KEY") or request.args.get("key") != os.environ.get("ADMIN_KEY"):
+        return jsonify({"error": "unauthorized (ADMIN_KEY সেট করে ?key=... দিন)"}), 401
+    uid = request.args.get("uid", "")
+    if not uid.isdigit(): return jsonify({"error": "uid লাগবে"}), 400
+    path = request.args.get("path", "GetPlayerStats").strip("/")
+    modes = [int(x) for x in request.args.get("modes", "0,1,2,3").split(",") if x.strip().isdigit()]
+    cred = (ordered_accounts("BD") or [None])[0]
+    info = request_token(cred, "BD") if cred else None
+    if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
+    results = []
+    for m in modes:
+        req = main_pb2.GetPlayerPersonalShow()
+        json_format.ParseDict({'a': int(uid), 'b': m}, req)
+        enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, req.SerializeToString())
+        headers = {'User-Agent': USERAGENT, 'Content-Type': "application/octet-stream", 'Authorization': info["token"], 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
+        try:
+            with httpx.Client(timeout=10.0, verify=False) as client:
+                r = client.post(info["server_url"].rstrip('/') + "/" + path, content=enc, headers=headers)
+            row = {"b": m, "status": r.status_code, "bytes": len(r.content)}
+            if r.status_code == 200 and r.content:
+                try: row["decoded"] = parse_wire(r.content)
+                except Exception as e: row["decode_error"] = str(e); row["hex"] = r.content[:200].hex()
+        except Exception as e:
+            row = {"b": m, "error": str(e)}
+        results.append(row)
+    return jsonify({"path": path, "uid": uid, "results": results})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

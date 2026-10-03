@@ -459,11 +459,15 @@ def parse_wire(buf, depth=0):
         elif wt == 2:
             ln, i = varint(i); chunk = buf[i:i + ln]; i += ln
             if len(chunk) != ln: raise ValueError("truncated")
+            v = None
+            printable = False
             try:
-                txt = chunk.decode("utf-8"); v = txt if txt.isprintable() else None
-            except Exception: v = None
-            if v is None and depth < 4:
-                try: v = parse_wire(chunk, depth + 1)
+                txt = chunk.decode("utf-8"); printable = txt.isprintable()
+            except Exception: txt = None
+            if printable:
+                v = txt                      # সম্পূর্ণ ছাপার-যোগ্য → স্ট্রিং (যেমন "7703449332")
+            elif depth < 5:
+                try: v = parse_wire(chunk, depth + 1)   # নিয়ন্ত্রণ-বাইট আছে → নেস্টেড মেসেজ
                 except Exception: v = None
             if v is None or v == {}: v = chunk.hex()
         else: raise ValueError("bad wiretype")
@@ -525,56 +529,51 @@ KNOWN_INGAME = {   # UID 7703449332 — আপনার ইন-গেম রে�
 
 @app.route('/stats-calibrate', methods=['GET'])
 def stats_calibrate():
+    """আগের রানে পাওয়া গেছে: GetPlayerStats-এ field1=accountid, field2=matchmode, field3=gamemode কাজ করে;
+       matchmode 0/1/2 সাড়া দেয়, CS gamemode=15। এখন কাঁচা ডিকোড-ট্রি দেখাচ্ছি (BR-এর gamemode মান খোঁজাও এখানে)।"""
     if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
     uid = request.args.get("uid", "7703449332")
     if not uid.isdigit(): return jsonify({"error": "uid লাগবে"}), 400
-    kind = request.args.get("kind", "cs").lower()
+    kind = request.args.get("kind", "both").lower()
     path = request.args.get("path", "GetPlayerStats").strip("/")
     ints = lambda k, d: [int(x) for x in request.args.get(k, d).split(",") if x.strip().isdigit()]
-    gms = ints("gm", "15" if kind == "cs" else "0,1,2,3")
-    mms = ints("mm", "0,1,2,3,4,5")
-    layouts = [tuple(int(x) for x in l.split("-")) for l in request.args.get("layout", "1-2-3,1-3-2").split(",") if l.count("-") == 2]
-    combos = [(l, g, m) for l in layouts for g in gms for m in mms]
-    if len(combos) > 40: return jsonify({"error": f"{len(combos)}টা কম্বিনেশন — সর্বোচ্চ ৪০। gm/mm/layout কমান"}), 400
+    mms = ints("mm", "0,1,2")
+    jobs = []   # (kind, gamemode, matchmode)
+    if kind in ("cs", "both"): jobs += [("cs", g, m) for g in ints("gmcs", "15") for m in mms]
+    if kind in ("br", "both"): jobs += [("br", g, m) for g in ints("gmbr", "0,1,2,3,4,5") for m in mms]
+    if len(jobs) > 40: return jsonify({"error": f"{len(jobs)}টা কম্বিনেশন — সর্বোচ্চ ৪০"}), 400
     cred = (ordered_accounts("BD") or [None])[0]
     info = request_token(cred, "BD") if cred else None
     if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
     url = info["server_url"].rstrip('/') + "/" + path
-    known = KNOWN_INGAME.get(kind, set())
 
-    def one(c):
-        (fa, fg, fm), g, m = c
-        raw = b"".join([_varint(fa << 3) + _varint(int(uid)), _varint(fg << 3) + _varint(g), _varint(fm << 3) + _varint(m)])
+    def one(job):
+        k, g, m = job
+        raw = _varint(1 << 3) + _varint(int(uid)) + _varint(2 << 3) + _varint(m) + _varint(3 << 3) + _varint(g)   # f1=acc, f2=matchmode, f3=gamemode
         enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, raw)
         headers = {'User-Agent': USERAGENT, 'Content-Type': "application/octet-stream", 'Authorization': info["token"], 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
-        row = {"layout": f"acc={fa},gamemode={fg},matchmode={fm}", "gamemode": g, "matchmode": m}
+        row = {"kind": k, "gamemode": g, "matchmode": m}
         try:
             with httpx.Client(timeout=8.0, verify=False) as client:
                 r = client.post(url, content=enc, headers=headers)
             row["status"], row["bytes"] = r.status_code, len(r.content)
             if r.status_code == 200 and r.content:
                 try:
-                    tree = parse_wire(r.content); seen = set(); _ints_in(tree, seen)
-                    row["known_found"] = sorted(seen & known); row["_tree"] = tree
+                    row["tree"] = parse_wire(r.content)
+                    seen = set(); _ints_in(row["tree"], seen); row["known_found"] = sorted(seen & KNOWN_INGAME.get(k, set()))
                 except Exception as e:
-                    row["decode_error"] = str(e)
+                    row["decode_error"] = str(e); row["hex"] = r.content[:160].hex()
         except Exception as e:
             row["error"] = str(e)[:80]
         return row
 
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=10) as ex:
-        rows = list(ex.map(one, combos))
-    counts = {}
-    for r in rows: counts[str(r.get("status", r.get("error", "?")))] = counts.get(str(r.get("status", r.get("error", "?"))), 0) + 1
-    got = [r for r in rows if r.get("bytes")]
-    got.sort(key=lambda r: -len(r.get("known_found", [])))
-    for i, r in enumerate(got):
-        if i >= 2 or not r.get("known_found"): r.pop("_tree", None)
-        else: r["tree"] = r.pop("_tree")
-    for r in got: r.pop("_tree", None)
-    return jsonify({"kind": kind, "uid": uid, "endpoint": path, "tried": len(combos), "status_counts": counts,
-                    "known_values_expected": sorted(known), "responses_with_data": got[:12]})
+        rows = list(ex.map(one, jobs))
+    empty = [f"{r['kind']} gm={r['gamemode']} mm={r['matchmode']}" for r in rows if not r.get("bytes")]
+    got = sorted([r for r in rows if r.get("bytes")], key=lambda r: (-len(r.get("known_found", [])), -r["bytes"]))
+    return jsonify({"uid": uid, "endpoint": path, "request_layout": "field1=accountid, field2=matchmode, field3=gamemode",
+                    "tried": len(jobs), "empty_responses": empty, "responses": got})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

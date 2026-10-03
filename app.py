@@ -96,7 +96,7 @@ def request_token(cred: dict, region: str):
         return c
     try:
         headers = {"User-Agent": USERAGENT, "Accept": "application/json"}
-        with httpx.Client(timeout=8.0, verify=False) as client:
+        with httpx.Client(timeout=6.0, verify=False) as client:
             resp = client.get(TOKEN_API_URL, params={"uid": uid_g, "password": pwd, "key": TOKEN_API_KEY}, headers=headers)
         if resp.status_code == 200:
             msg = resp.json()
@@ -105,20 +105,22 @@ def request_token(cred: dict, region: str):
                 cached_tokens[uid_g] = {
                     "token": raw if raw.startswith("Bearer ") else f"Bearer {raw}",
                     "region": msg.get("lockRegion") or msg.get("region") or region,
-                    "server_url": msg.get("serverUrl", "https://clientbp.ppmainecoonghj.com"),
-                    "expires_at": msg.get("expiry_time", now + 25200),
+                    "server_url": msg.get("serverUrl") or "https://clientbp.ppmainecoonghj.com",
+                    "expires_at": msg.get("expiry_time") or (now + 25200),
                 }
                 return cached_tokens[uid_g]
     except Exception as e:
         app.logger.error(f"Token generation failed for {uid_g[:3]}***: {e}")
     return None
 
-def fetch_player_data(uid: str, region: str = "BD"):
+def fetch_player_data(uid: str, region: str = "BD", deadline: float = None):
     pool = ordered_accounts(region)
     if not pool:
         raise Exception(f"No guest accounts configured for {region} (account_*.json ফাইল দেখুন)")
     last_err = "no response"
-    for cred in pool[:4]:
+    for cred in pool[:3]:
+        if deadline and time.time() > deadline:
+            last_err = "time budget over"; break
         info = request_token(cred, region)
         if not info:
             mark_bad(cred["uid"]); last_err = "token generation failed"; continue
@@ -132,7 +134,7 @@ def fetch_player_data(uid: str, region: str = "BD"):
         }
         url = info["server_url"].rstrip('/') + "/GetPlayerPersonalShow"
         try:
-            with httpx.Client(timeout=10.0, verify=False) as client:
+            with httpx.Client(timeout=7.0, verify=False) as client:
                 resp = client.post(url, content=data_enc, headers=headers)
         except Exception as e:
             last_err = str(e); continue
@@ -155,9 +157,11 @@ def get_player_data(uid: str):
     """UID-র ডেটা খুঁজে আনে (ক্যাশ করা পুল আগে)"""
     cached = uid_region_cache.get(uid)
     order = ([cached] if cached else []) + [p for p in POOLS if p != cached]
+    deadline = time.time() + 8.5          # Vercel Hobby 10s সীমার ভেতরে থাকতে
     for region in order:
+        if time.time() > deadline: break
         try:
-            data = fetch_player_data(uid, region)
+            data = fetch_player_data(uid, region, deadline)
             if data and (data.get("basicInfo") or data.get("basic_info")):
                 uid_region_cache[uid] = region
                 return data
@@ -290,7 +294,9 @@ def get_ban_status():
         return jsonify({"error": "Please provide a valid numeric UID."}), 400
 
     try:
-        data = fetch_player_data(uid, "BD")
+        data = get_player_data(uid)
+        if not data:
+            return jsonify({"error": "Player not found or guest accounts unavailable."}), 404
         basic = data.get("basicInfo") or data.get("basicinfo") or {}
         nickname = basic.get("nickname") or basic.get("PlayerNickname") or "Player"
         level = basic.get("level") or 0
@@ -302,7 +308,7 @@ def get_ban_status():
         return jsonify({
             "Nickname": nickname,
             "UID": uid,
-            "Region": "BD",
+            "Region": basic.get("region") or "BD",
             "level": level,
             "is_banned": is_banned,
             "ban_status": ban_status,
@@ -315,19 +321,30 @@ def get_ban_status():
 # 📊 STATS (সোর্স: flash-player-info-v1 — আমাদের প্রোটো ফাইলে stats মেসেজ নেই)
 # ⚠️ সোর্স না পেলে নকল/হার্ডকোড ডেটা দেওয়া হয় না — 502 এরর ফেরত যায়
 # ==============================================================================
-STATS_UPSTREAM = os.environ.get("STATS_API_URL", "https://flash-player-info-v1.vercel.app/stats").rstrip("/")
+STATS_UPSTREAM = os.environ.get("STATS_API_URL", "").rstrip("/")   # খালি = কোনো বাইরের (Flash) স্ট্যাটস API ব্যবহার হবে না
+
+STATS_REASONS = {}   # (uid, mode, kind) -> শেষ ব্যর্থতার কারণ
 
 def fetch_stats_raw(uid, match_mode, kind):
-    last = None
-    for timeout in (6.0, 4.0):
+    key = (uid, match_mode, kind); reason = {}
+    if not STATS_UPSTREAM:
+        STATS_REASONS[key] = {"why": "নিজস্ব Garena স্ট্যাটস ডিকোডার এখনও বসানো হয়নি — /stats-calibrate চালিয়ে আউটপুট পাঠান"}
+        return None
+    for timeout in (6.0, 3.0):
+        t0 = time.time()
         try:
             with httpx.Client(timeout=timeout, verify=False) as client:
                 r = client.get(f"{STATS_UPSTREAM}/{match_mode}/{kind}", params={"uid": uid}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
+            reason = {"upstream_status": r.status_code, "ms": int((time.time() - t0) * 1000), "body": r.text[:160]}
             if r.status_code == 200:
                 d = r.json()
-                if isinstance(d, dict) and d: return d
+                if isinstance(d, dict) and d:
+                    STATS_REASONS.pop(key, None); return d
+                reason["why"] = "empty or non-object JSON"
         except Exception as e:
-            last = e
+            reason = {"exception": type(e).__name__, "detail": str(e)[:100], "ms": int((time.time() - t0) * 1000), "timeout_s": timeout}
+    if len(STATS_REASONS) > 300: STATS_REASONS.clear()
+    STATS_REASONS[key] = reason
     return None
 
 def build_br(uid, match_mode):
@@ -364,7 +381,8 @@ def stats_route(builder):
     match_mode = "RANKED" if mode == "RANKED" else "CAREER"
     res = builder(uid, match_mode)
     if res is None:
-        return jsonify({"error": "Stats source unavailable. Please try again.", "uid": uid, "mode": match_mode}), 502
+        kind = "br" if builder is build_br else "cs"
+        return jsonify({"error": "Stats source unavailable. Please try again.", "uid": uid, "mode": match_mode, "reason": STATS_REASONS.get((uid, match_mode, kind), {})}), 502
     return jsonify(res)
 
 # 5. 🏆 BR STATS
@@ -387,6 +405,7 @@ def get_all_stats():
         out = {k: f.result() for k, f in futs.items()}
     out["uid"] = uid
     out["errors"] = [k for k, v in out.items() if k != "uid" and v is None]
+    out["reasons"] = {k: STATS_REASONS.get((uid, jobs[k][1], "br" if k.startswith("br") else "cs"), {}) for k in out["errors"]}
     return jsonify(out)
 
 

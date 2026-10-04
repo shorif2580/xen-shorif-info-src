@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import httpx
 import json
@@ -593,6 +594,81 @@ def stats_calibrate():
     got = sorted([r for r in rows if r.get("bytes")], key=lambda r: (-len(r.get("known_found", [])), -r["bytes"]))
     return jsonify({"uid": uid, "endpoint": path, "request_layout": "field1=accountid, field2=matchmode, field3=gamemode",
                     "tried": len(jobs), "empty_responses": empty, "responses": got})
+
+
+# 12. 🔬 STATS-RAW — ডিপ্লয় না বদলে URL থেকেই রিকোয়েস্টের ফিল্ড বদলে পরীক্ষা করার রুট
+#   /stats-raw?uid=7703449332&mm=0&f=4:15           → ফিল্ড৪=১৫ সহ একটা রিকোয়েস্ট (f=৩:১,৪:১৫ ... কমা দিয়ে একাধিক)
+#   /stats-raw?uid=7703449332&mm=0&scan=3-16:15     → ফিল্ড ৩ থেকে ১৬ একে একে =১৫ দিয়ে চালায়, বেসলাইনের (অতিরিক্ত ফিল্ড ছাড়া) সাথে তুলনা করে
+#   path=GetPlayerStats (বদলানো যায়),  যে সাড়া বেসলাইন থেকে আলাদা — সেটাই নতুন কিছু (যেমন CS)।
+@app.route('/stats-raw', methods=['GET'])
+def stats_raw():
+    if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
+    import hashlib
+    uid = request.args.get("uid", "7703449332")
+    if not uid.isdigit(): return jsonify({"error": "uid লাগবে"}), 400
+    path = request.args.get("path", "GetPlayerStats").strip("/")
+    mm = int(request.args.get("mm", "0")) if request.args.get("mm", "0").isdigit() else 0
+    kind = request.args.get("kind", "cs").lower()
+    def parse_f(s):
+        out = []
+        for part in [p for p in s.split(",") if p.strip()]:
+            n, _, v = part.partition(":")
+            if n.strip().isdigit() and v.strip().lstrip("-").isdigit(): out.append((int(n), int(v)))
+        return out
+    variants = []   # (label, extras)
+    if request.args.get("f"):
+        variants.append(("f=" + request.args["f"], parse_f(request.args["f"])))
+    scan = request.args.get("scan", "")
+    m = re.match(r"^(\d+)-(\d+):(-?\d+)$", scan) if scan else None
+    if m:
+        lo, hi, val = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        variants += [(f"field{n}={val}", [(n, val)]) for n in range(lo, hi + 1)]
+    if not variants: return jsonify({"error": "f=... বা scan=3-16:15 দিন"}), 400
+    variants = [("baseline", [])] + variants
+    if len(variants) > 40: return jsonify({"error": f"{len(variants)}টা রিকোয়েস্ট — সর্বোচ্চ ৪০"}), 400
+    cred = (ordered_accounts("BD") or [None])[0]
+    info = request_token(cred, "BD") if cred else None
+    if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
+    url = info["server_url"].rstrip('/') + "/" + path
+    known = KNOWN_INGAME.get(kind, set())
+
+    def one(v):
+        label, extras = v
+        raw = _varint(1 << 3) + _varint(int(uid)) + _varint(2 << 3) + _varint(mm)
+        for n, val in extras:
+            raw += _varint(n << 3) + _varint(val if val >= 0 else val + (1 << 64))
+        enc = aes_cbc_encrypt(MAIN_KEY, MAIN_IV, raw)
+        headers = {'User-Agent': USERAGENT, 'Content-Type': "application/octet-stream", 'Authorization': info["token"], 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
+        row = {"variant": label}
+        try:
+            with httpx.Client(timeout=8.0, verify=False) as client:
+                r = client.post(url, content=enc, headers=headers)
+            row["status"], row["bytes"] = r.status_code, len(r.content)
+            row["sha1"] = hashlib.sha1(r.content).hexdigest()[:10]
+            if r.status_code == 200 and r.content:
+                try:
+                    row["tree"] = parse_wire(r.content)
+                    seen = set(); _ints_in(row["tree"], seen); row["known_found"] = sorted(seen & known)
+                except Exception as e:
+                    row["decode_error"] = str(e); row["hex"] = r.content[:160].hex()
+        except Exception as e:
+            row["error"] = str(e)[:80]
+        return row
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        rows = list(ex.map(one, variants))
+    base = rows[0]
+    out = [{"variant": "baseline", "status": base.get("status"), "bytes": base.get("bytes"), "sha1": base.get("sha1")}]
+    for r in rows[1:]:
+        diff = r.get("sha1") != base.get("sha1")
+        item = {"variant": r["variant"], "status": r.get("status"), "bytes": r.get("bytes"), "sha1": r.get("sha1"), "differs_from_baseline": diff}
+        if r.get("error"): item["error"] = r["error"]
+        if diff:                       # আলাদা সাড়ার পুরো ডিকোড দেখাই
+            item["known_found"] = r.get("known_found"); item["tree"] = r.get("tree"); item["decode_error"] = r.get("decode_error")
+        out.append(item)
+    return jsonify({"uid": uid, "endpoint": path, "matchmode": mm, "note": "differs_from_baseline=true মানে এই ফিল্ড সার্ভার আমলে নিয়েছে",
+                    "results": out})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

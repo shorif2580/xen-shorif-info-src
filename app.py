@@ -5,6 +5,7 @@ import httpx
 import json
 import base64
 import itertools
+import threading
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, redirect
 from flask_cors import CORS
@@ -88,31 +89,147 @@ def ordered_accounts(region: str) -> list:
     now = time.time()
     return [c for c in lst if bad_accounts.get(c["uid"], 0) <= now] or lst
 
-def request_token(cred: dict, region: str):
-    """একটি গেস্ট আইডির টোকেন (ক্যাশ বা নতুন); ব্যর্থ হলে None"""
-    uid_g, pwd = cred["uid"], cred["password"]
-    now = time.time()
-    c = cached_tokens.get(uid_g)
-    if c and now < c.get("expires_at", 0) - 60:
-        return c
-    try:
-        headers = {"User-Agent": USERAGENT, "Accept": "application/json"}
-        with httpx.Client(timeout=6.0, verify=False) as client:
-            resp = client.get(TOKEN_API_URL, params={"uid": uid_g, "password": pwd, "key": TOKEN_API_KEY}, headers=headers)
-        if resp.status_code == 200:
-            msg = resp.json()
-            raw = msg.get("token", "")
-            if raw:
-                cached_tokens[uid_g] = {
-                    "token": raw if raw.startswith("Bearer ") else f"Bearer {raw}",
-                    "region": msg.get("lockRegion") or msg.get("region") or region,
-                    "server_url": msg.get("serverUrl") or "https://clientbp.ppmainecoonghj.com",
-                    "expires_at": msg.get("expiry_time") or (now + 25200),
-                }
-                return cached_tokens[uid_g]
-    except Exception as e:
-        app.logger.error(f"Token generation failed for {uid_g[:3]}***: {e}")
+# ==============================================================================
+# 🎟 DUAL TOKEN SOURCES — দুটো সার্ভিস একসাথে চালু; যেটা আগে বৈধ JWT দেয় সেটাই ব্যবহার হয়
+#   env: TOKEN_SOURCES=flash,abhi  (শুধু একটা চাইলে TOKEN_SOURCES=flash)
+# ==============================================================================
+ABHI_TOKEN_URL = os.environ.get("ABHI_TOKEN_URL", "https://abhi-jwt-2iax.vercel.app/token")
+ABHI_API_KEY = os.environ.get("ABHI_API_KEY", "ABHI")
+DEFAULT_SERVER_URL = "https://clientbp.ppmainecoonghj.com"
+JWT_RE = re.compile(r"^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$")
+SOURCE_STATS = {}   # name -> {"ok": n, "fail": n, "last_ms": ms, "last_error": str}
+
+def _sources():
+    names = [x.strip().lower() for x in os.environ.get("TOKEN_SOURCES", "flash,abhi").split(",") if x.strip()]
+    table = {
+        "flash": (TOKEN_API_URL, lambda u, p: {"uid": u, "password": p, "key": TOKEN_API_KEY}),
+        "abhi": (ABHI_TOKEN_URL, lambda u, p: {"uid": u, "password": p, "api_key": ABHI_API_KEY}),
+    }
+    return [(n, table[n][0], table[n][1]) for n in names if n in table]
+
+def _strip_bearer(v):
+    return v[7:] if isinstance(v, str) and v.startswith("Bearer ") else v
+
+def _find_jwt(d):
+    """JSON-এর যেকোনো জায়গা থেকে JWT খোঁজে (ফরম্যাট না জেনেও)। token/jwt নামের কী আগে, তারপর JWT-আকৃতির যেকোনো স্ট্রিং"""
+    if isinstance(d, dict):
+        for k in ("token", "jwt", "access_jwt", "jwt_token", "accessToken"):
+            v = _strip_bearer(d.get(k))
+            if isinstance(v, str) and JWT_RE.match(v): return v
+        for v in d.values():
+            r = _find_jwt(v)
+            if r: return r
+    elif isinstance(d, list):
+        for v in d:
+            r = _find_jwt(v)
+            if r: return r
+    elif isinstance(d, str):
+        v = _strip_bearer(d)
+        if JWT_RE.match(v): return v
     return None
+
+def _find_str(d, keys):
+    if isinstance(d, dict):
+        low = {str(k).lower(): v for k, v in d.items()}
+        for k in keys:
+            v = low.get(k.lower())
+            if isinstance(v, (str, int)) and str(v): return str(v)
+        for v in d.values():
+            r = _find_str(v, keys)
+            if r: return r
+    elif isinstance(d, list):
+        for v in d:
+            r = _find_str(v, keys)
+            if r: return r
+    return None
+
+def _jwt_payload(jwt):
+    try:
+        p = jwt.split(".")[1]; p += "=" * (-len(p) % 4)
+        return json.loads(base64.urlsafe_b64decode(p.encode()).decode("utf-8"))
+    except Exception:
+        return {}
+
+def parse_token_response(d, region, now):
+    """যেকোনো সোর্সের JSON → স্ট্যান্ডার্ড টোকেন-ইনফো; JWT না পেলে None"""
+    jwt = _find_jwt(d)
+    if not jwt: return None
+    payload = _jwt_payload(jwt)
+    server = _find_str(d, ["serverUrl", "server_url", "base_url"]) or _find_str(payload, ["serverUrl", "server_url"])
+    if not (server and server.startswith("http")): server = DEFAULT_SERVER_URL
+    exp = _find_str(d, ["expiry_time", "expires_at"]) or payload.get("exp")
+    try: exp = float(exp)
+    except Exception: exp = now + 25200
+    if exp < now + 120: exp = now + 25200
+    reg = _find_str(d, ["lockRegion", "lock_region", "region"]) or payload.get("lock_region") or region
+    return {"token": "Bearer " + jwt, "region": str(reg), "server_url": server, "expires_at": exp}
+
+def _call_source(name, url, params_fn, uid_g, pwd, region, timeout=4.5):
+    t0 = time.time(); err = None; info = None; status = None; keys = []
+    try:
+        with httpx.Client(timeout=timeout, verify=False) as client:
+            resp = client.get(url, params=params_fn(uid_g, pwd), headers={"User-Agent": USERAGENT, "Accept": "application/json"})
+        status = resp.status_code
+        d = resp.json()
+        keys = sorted(map(str, d.keys())) if isinstance(d, dict) else []
+        info = parse_token_response(d, region, time.time()) if status == 200 else None
+        if not info:
+            msg = _find_str(d, ["error", "message", "msg", "detail"]) if isinstance(d, dict) else None
+            err = f"HTTP {status}" + (f" | {str(msg)[:60]}" if msg else " | JWT নেই")
+    except Exception as e:
+        err = f"{type(e).__name__}: {str(e)[:50]}"
+    ms = int((time.time() - t0) * 1000)
+    st = SOURCE_STATS.setdefault(name, {"ok": 0, "fail": 0})
+    st["ok" if info else "fail"] += 1; st["last_ms"] = ms; st["last_error"] = None if info else err
+    return {"source": name, "info": info, "ms": ms, "status": status, "keys": keys, "error": err}
+
+# ⚠️ একই গেস্ট আইডি দিয়ে দুই সার্ভিসে একসাথে লগইন করলে একটা সেশন আরেকটাকে বাতিল করতে পারে।
+#    তাই: (১) একটা আইডির জন্য সোর্সগুলো এক-এক করে (একসাথে নয়) চেষ্টা হয়, (২) যেটা আগে সফল হয়েছিল সেটাই আগে,
+#    (৩) প্রথমটা ব্যর্থ হলে তবেই দ্বিতীয়টা, (৪) একই আইডিতে একই সময়ে দুই রিকোয়েস্ট লগইন করে না (লক)।
+PREF_SOURCE = {}          # guest_uid -> শেষবার যে সোর্স সফল ছিল
+_uid_locks = {}
+_locks_guard = threading.Lock()
+
+def _lock_for(uid):
+    with _locks_guard:
+        return _uid_locks.setdefault(uid, threading.Lock())
+
+def _source_order(uid):
+    srcs = _sources()
+    if len(srcs) <= 1: return srcs
+    pref = PREF_SOURCE.get(uid)
+    if pref:
+        return sorted(srcs, key=lambda s: 0 if s[0] == pref else 1)
+    k = int(uid) % len(srcs) if str(uid).isdigit() else 0      # আইডিগুলো দুই সোর্সে ভাগ হয়ে শুরু করে
+    return srcs[k:] + srcs[:k]
+
+def request_token(cred: dict, region: str, detail: bool = False, deadline: float = None):
+    """টোকেন (ক্যাশ বা নতুন); ব্যর্থ হলে None।
+       detail=True (শুধু টেস্টের জন্য): দুই সোর্সই এক-এক করে চালায়, ক্যাশ করে না — {"winner":..., "results":[...]}"""
+    uid_g, pwd = cred["uid"], cred["password"]
+    with _lock_for(uid_g):
+        now = time.time()
+        c = cached_tokens.get(uid_g)
+        if c and now < c.get("expires_at", 0) - 60 and not detail:
+            return c
+        results, winner = [], None
+        for n, u, pf in _source_order(uid_g):
+            if deadline and time.time() > deadline: break
+            r = _call_source(n, u, pf, uid_g, pwd, region)
+            results.append(r)
+            if r["info"] and winner is None:
+                winner = r
+                if not detail: break              # সফল হলে দ্বিতীয় সোর্সে লগইন নয়
+        if detail:
+            cached_tokens.pop(uid_g, None)         # টেস্টে দুবার লগইন হয়েছে — পুরনো টোকেন বাতিল ধরে ক্যাশ মুছি
+            PREF_SOURCE.pop(uid_g, None)
+            return {"winner": winner["source"] if winner else None, "results": results}
+        if winner:
+            cached_tokens[uid_g] = dict(winner["info"], source=winner["source"])
+            PREF_SOURCE[uid_g] = winner["source"]
+            return cached_tokens[uid_g]
+        PREF_SOURCE.pop(uid_g, None)
+        return None
 
 def fetch_player_data(uid: str, region: str = "BD", deadline: float = None):
     pool = ordered_accounts(region)
@@ -122,7 +239,7 @@ def fetch_player_data(uid: str, region: str = "BD", deadline: float = None):
     for cred in pool[:3]:
         if deadline and time.time() > deadline:
             last_err = "time budget over"; break
-        info = request_token(cred, region)
+        info = request_token(cred, region, deadline=deadline)
         if not info:
             mark_bad(cred["uid"]); last_err = "token generation failed"; continue
         req = main_pb2.GetPlayerPersonalShow()
@@ -231,13 +348,29 @@ def accounts_status():
         for c in lst:
             u = str(c.get("uid", ""))
             row = {"uid": mask(u), "cooldown_s": max(0, int(bad_accounts.get(u, 0) - now)),
-                   "token_cached": bool(cached_tokens.get(u) and now < cached_tokens[u].get("expires_at", 0))}
+                   "token_cached": bool(cached_tokens.get(u) and now < cached_tokens[u].get("expires_at", 0)),
+                   "source": (cached_tokens.get(u) or {}).get("source")}
             if live:
                 row["token_ok"] = request_token(c, group) is not None
                 if not row["token_ok"]: mark_bad(u)
             rows.append(row)
         out[group] = rows
-    return jsonify({"token_api": TOKEN_API_URL.split("/token")[0], "accounts": out})
+    return jsonify({"token_sources": [s[0] for s in _sources()], "source_stats": SOURCE_STATS, "accounts": out})
+
+# 🆚 TOKEN COMPARE — একটা গেস্ট আইডি দিয়ে দুই সার্ভিসের ফলাফল পাশাপাশি (টোকেনের মান লুকানো)
+@app.route('/token-compare', methods=['GET', 'POST'])
+def token_compare():
+    if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
+    uid_g = (request.values.get("uid") or "").strip(); pwd = (request.values.get("password") or "").strip()
+    if not uid_g.isdigit() or not pwd: return jsonify({"error": "uid (numeric) আর password দিন"}), 400
+    res = request_token({"uid": uid_g, "password": pwd}, request.values.get("region", "BD"), detail=True)
+    rows = []
+    for r in res["results"]:
+        info = r["info"]
+        rows.append({"source": r["source"], "ok": bool(info), "ms": r["ms"], "http": r["status"], "error": r["error"], "response_keys": r["keys"],
+                     "server_url": info["server_url"] if info else None, "region": info["region"] if info else None,
+                     "expires_in_min": int((info["expires_at"] - time.time()) / 60) if info else None, "jwt_length": len(info["token"]) - 7 if info else None})
+    return jsonify({"uid": uid_g[:3] + "****" + uid_g[-3:], "winner": res["winner"], "note": "টেস্টে দুই সোর্সে এক-এক করে লগইন হয়েছে; এই আইডির ক্যাশ-টোকেন মুছে দেওয়া হয়েছে", "sources": rows})
 
 # 1. PLAYER INFO ROUTE
 @app.route('/player-info', methods=['GET'])
@@ -451,15 +584,11 @@ def token_passthrough():
     uid_g, pwd = request.values.get("uid", "").strip(), request.values.get("password", "").strip()
     if not uid_g.isdigit() or not pwd:
         return jsonify({"error": "uid (numeric) আর password দিন"}), 400
-    try:
-        with httpx.Client(timeout=12.0, verify=False) as client:
-            r = client.get(TOKEN_API_URL, params={"uid": uid_g, "password": pwd, "key": TOKEN_API_KEY}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
-        data = r.json()
-    except Exception as e:
-        return jsonify({"error": f"Token service unavailable: {e}"}), 502
-    if r.status_code != 200 or not isinstance(data, dict) or not (data.get("token") or data.get("access_token")):
-        return jsonify({"error": "Token generate হয়নি (আইডি/পাসওয়ার্ড ভুল বা ব্যান হতে পারে)", "service_status": r.status_code}), 502
-    return jsonify(data)
+    res = request_token({"uid": uid_g, "password": pwd}, request.values.get("region", "BD"), detail=True)
+    if not res["winner"]:
+        return jsonify({"error": "Token generate হয়নি (আইডি/পাসওয়ার্ড ভুল, ব্যান, বা সার্ভিস বন্ধ)", "tried": [{"source": r["source"], "error": r["error"]} for r in res["results"]]}), 502
+    info = cached_tokens.get(uid_g, {})
+    return jsonify({"source": res["winner"], "token": info.get("token", "")[7:], "serverUrl": info.get("server_url"), "region": info.get("region"), "expires_at": info.get("expires_at")})
 
 # 10. 🧪 STATS PROBE — শুধু ডায়াগনস্টিক। Garena-র স্ট্যাটস রেসপন্সের কাঁচা (স্কিমাহীন) ডিকোড দেখায়।
 #     ⚠️ এন্ডপয়েন্ট নাম/রিকোয়েস্ট ফরম্যাট আমার যাচাই করা নয় — ফলাফল দেখে মিলিয়ে নেওয়ার জন্য।

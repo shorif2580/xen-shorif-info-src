@@ -631,8 +631,7 @@ def stats_probe():
     if not uid.isdigit(): return jsonify({"error": "uid লাগবে"}), 400
     path = request.args.get("path", "GetPlayerStats").strip("/")
     modes = [int(x) for x in request.args.get("modes", "0,1,2,3").split(",") if x.strip().isdigit()]
-    cred = (ordered_accounts("BD") or [None])[0]
-    info = request_token(cred, "BD") if cred else None
+    info = any_token("BD")
     if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
     results = []
     for m in modes:
@@ -691,8 +690,7 @@ def stats_calibrate():
     if kind in ("cs", "both"): jobs += [("cs", g, m) for g in ints("gmcs", "15") for m in mms]
     if kind in ("br", "both"): jobs += [("br", g, m) for g in ints("gmbr", "0,1,2,3,4,5") for m in mms]
     if len(jobs) > 40: return jsonify({"error": f"{len(jobs)}টা কম্বিনেশন — সর্বোচ্চ ৪০"}), 400
-    cred = (ordered_accounts("BD") or [None])[0]
-    info = request_token(cred, "BD") if cred else None
+    info = any_token("BD")
     if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
     url = info["server_url"].rstrip('/') + "/" + path
 
@@ -725,10 +723,19 @@ def stats_calibrate():
                     "tried": len(jobs), "empty_responses": empty, "responses": got})
 
 
-# 12. 🔬 STATS-RAW — ডিপ্লয় না বদলে URL থেকেই রিকোয়েস্টের ফিল্ড বদলে পরীক্ষা করার রুট
-#   /stats-raw?uid=7703449332&mm=0&f=4:15           → ফিল্ড৪=১৫ সহ একটা রিকোয়েস্ট (f=৩:১,৪:১৫ ... কমা দিয়ে একাধিক)
-#   /stats-raw?uid=7703449332&mm=0&scan=3-16:15     → ফিল্ড ৩ থেকে ১৬ একে একে =১৫ দিয়ে চালায়, বেসলাইনের (অতিরিক্ত ফিল্ড ছাড়া) সাথে তুলনা করে
-#   path=GetPlayerStats (বদলানো যায়),  যে সাড়া বেসলাইন থেকে আলাদা — সেটাই নতুন কিছু (যেমন CS)।
+# 12. 🔬 STATS-RAW — ডিপ্লয় না বদলে URL থেকেই রিকোয়েস্ট বদলে পরীক্ষা করার রুট (ফিল্ড১=uid, ফিল্ড২=matchmode সবসময় থাকে)
+#   scan=3-16:15      → ফিল্ড ৩ থেকে ১৬ একে একে =১৫
+#   vscan=3:0-40      → ফিল্ড ৩-এ মান ০ থেকে ৪০ একে একে
+#   mmscan=0-20&f=3:15→ matchmode ০ থেকে ২০ একে একে (f=-র অতিরিক্ত ফিল্ড সহ)
+#   f=4:15,5:2        → একটা রিকোয়েস্টে একাধিক অতিরিক্ত ফিল্ড
+#   আউটপুটে একই সাড়া (sha1) বারবার দেখানো হয় না — "same_as" লেখা থাকে; নতুন ধরনের সাড়ার পুরো ডিকোড আসে।
+def any_token(region="BD", tries=4):
+    """কাজ করা একটা গেস্ট টোকেন খোঁজে (একটা ব্যর্থ হলে পরেরটা)"""
+    for cred in ordered_accounts(region)[:tries]:
+        info = request_token(cred, region)
+        if info: return info
+    return None
+
 @app.route('/stats-raw', methods=['GET'])
 def stats_raw():
     if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
@@ -736,33 +743,40 @@ def stats_raw():
     uid = request.args.get("uid", "7703449332")
     if not uid.isdigit(): return jsonify({"error": "uid লাগবে"}), 400
     path = request.args.get("path", "GetPlayerStats").strip("/")
-    mm = int(request.args.get("mm", "0")) if request.args.get("mm", "0").isdigit() else 0
+    mm0 = int(request.args["mm"]) if request.args.get("mm", "").isdigit() else 0
     kind = request.args.get("kind", "cs").lower()
+
     def parse_f(s):
         out = []
         for part in [p for p in s.split(",") if p.strip()]:
             n, _, v = part.partition(":")
             if n.strip().isdigit() and v.strip().lstrip("-").isdigit(): out.append((int(n), int(v)))
         return out
-    variants = []   # (label, extras)
-    if request.args.get("f"):
-        variants.append(("f=" + request.args["f"], parse_f(request.args["f"])))
-    scan = request.args.get("scan", "")
-    m = re.match(r"^(\d+)-(\d+):(-?\d+)$", scan) if scan else None
+    extras_f = parse_f(request.args.get("f", ""))
+    variants = []     # (label, extras, matchmode)
+    if extras_f: variants.append(("f=" + request.args["f"], extras_f, mm0))
+    m = re.match(r"^(\d+)-(\d+):(-?\d+)$", request.args.get("scan", ""))
     if m:
         lo, hi, val = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        variants += [(f"field{n}={val}", [(n, val)]) for n in range(lo, hi + 1)]
-    if not variants: return jsonify({"error": "f=... বা scan=3-16:15 দিন"}), 400
-    variants = [("baseline", [])] + variants
-    if len(variants) > 40: return jsonify({"error": f"{len(variants)}টা রিকোয়েস্ট — সর্বোচ্চ ৪০"}), 400
-    cred = (ordered_accounts("BD") or [None])[0]
-    info = request_token(cred, "BD") if cred else None
-    if not info: return jsonify({"error": "token পাওয়া যায়নি"}), 502
+        variants += [(f"field{n}={val}", extras_f + [(n, val)], mm0) for n in range(lo, hi + 1)]
+    m = re.match(r"^(\d+):(\d+)-(\d+)$", request.args.get("vscan", ""))
+    if m:
+        fld, lo, hi = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        variants += [(f"field{fld}={v}", extras_f + [(fld, v)], mm0) for v in range(lo, hi + 1)]
+    m = re.match(r"^(\d+)-(\d+)$", request.args.get("mmscan", ""))
+    if m:
+        lo, hi = int(m.group(1)), int(m.group(2))
+        variants += [(f"mm={v}" + (f"+{request.args['f']}" if extras_f else ""), extras_f, v) for v in range(lo, hi + 1)]
+    if not variants: return jsonify({"error": "scan=3-16:15  বা  vscan=3:0-40  বা  mmscan=0-20  বা  f=4:15 দিন"}), 400
+    variants = [("baseline", [], mm0)] + variants
+    if len(variants) > 50: return jsonify({"error": f"{len(variants)}টা রিকোয়েস্ট — সর্বোচ্চ ৫০"}), 400
+    info = any_token("BD")
+    if not info: return jsonify({"error": "কোনো গেস্ট আইডির টোকেন পাওয়া যায়নি"}), 502
     url = info["server_url"].rstrip('/') + "/" + path
     known = KNOWN_INGAME.get(kind, set())
 
     def one(v):
-        label, extras = v
+        label, extras, mm = v
         raw = _varint(1 << 3) + _varint(int(uid)) + _varint(2 << 3) + _varint(mm)
         for n, val in extras:
             raw += _varint(n << 3) + _varint(val if val >= 0 else val + (1 << 64))
@@ -776,8 +790,9 @@ def stats_raw():
             row["sha1"] = hashlib.sha1(r.content).hexdigest()[:10]
             if r.status_code == 200 and r.content:
                 try:
-                    row["tree"] = parse_wire(r.content)
-                    seen = set(); _ints_in(row["tree"], seen); row["known_found"] = sorted(seen & known)
+                    row["_tree"] = parse_wire(r.content)
+                    row["top_fields"] = sorted(row["_tree"].keys(), key=int)
+                    seen = set(); _ints_in(row["_tree"], seen); row["known_found"] = sorted(seen & known)
                 except Exception as e:
                     row["decode_error"] = str(e); row["hex"] = r.content[:160].hex()
         except Exception as e:
@@ -788,16 +803,23 @@ def stats_raw():
     with ThreadPoolExecutor(max_workers=10) as ex:
         rows = list(ex.map(one, variants))
     base = rows[0]
-    out = [{"variant": "baseline", "status": base.get("status"), "bytes": base.get("bytes"), "sha1": base.get("sha1")}]
+    first_seen = {base.get("sha1"): "baseline"}
+    out = [{"variant": "baseline", "status": base.get("status"), "bytes": base.get("bytes"), "sha1": base.get("sha1"), "top_fields": base.get("top_fields")}]
     for r in rows[1:]:
-        diff = r.get("sha1") != base.get("sha1")
-        item = {"variant": r["variant"], "status": r.get("status"), "bytes": r.get("bytes"), "sha1": r.get("sha1"), "differs_from_baseline": diff}
+        item = {"variant": r["variant"], "status": r.get("status"), "bytes": r.get("bytes"), "sha1": r.get("sha1")}
         if r.get("error"): item["error"] = r["error"]
-        if diff:                       # আলাদা সাড়ার পুরো ডিকোড দেখাই
-            item["known_found"] = r.get("known_found"); item["tree"] = r.get("tree"); item["decode_error"] = r.get("decode_error")
+        sh = r.get("sha1")
+        if sh in first_seen:
+            item["same_as"] = first_seen[sh]
+        else:
+            first_seen[sh] = r["variant"]
+            item["NEW_RESPONSE"] = True
+            item["top_fields"] = r.get("top_fields"); item["known_found"] = r.get("known_found")
+            item["tree"] = r.get("_tree"); item["decode_error"] = r.get("decode_error")
         out.append(item)
-    return jsonify({"uid": uid, "endpoint": path, "matchmode": mm, "note": "differs_from_baseline=true মানে এই ফিল্ড সার্ভার আমলে নিয়েছে",
-                    "results": out})
+    new_count = sum(1 for x in out if x.get("NEW_RESPONSE"))
+    return jsonify({"uid": uid, "endpoint": path, "base_matchmode": mm0, "tried": len(variants) - 1, "new_responses": new_count,
+                    "note": "NEW_RESPONSE=true মানে বেসলাইন বা আগের কোনো সাড়ার চেয়ে আলাদা — এটাই নতুন কিছু", "results": out})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)

@@ -162,7 +162,8 @@ def parse_token_response(d, region, now):
     except Exception: exp = now + 25200
     if exp < now + 120: exp = now + 25200
     reg = _find_str(d, ["lockRegion", "lock_region", "region"]) or payload.get("lock_region") or region
-    return {"token": "Bearer " + jwt, "region": str(reg), "server_url": server, "expires_at": exp}
+    extra = {k: v for k, v in ((k, _find_str(d, [k])) for k in ("access_token", "open_id", "account_id", "account_name", "platform")) if v}
+    return {"token": "Bearer " + jwt, "region": str(reg), "server_url": server, "expires_at": exp, "extra": extra}
 
 def _call_source(name, url, params_fn, uid_g, pwd, region, timeout=4.5):
     t0 = time.time(); err = None; info = None; status = None; keys = []
@@ -282,6 +283,8 @@ def get_player_data(uid: str):
             data = fetch_player_data(uid, region, deadline)
             if data and (data.get("basicInfo") or data.get("basic_info")):
                 uid_region_cache[uid] = region
+                try: NICK_CACHE[uid] = (data.get("basicInfo") or {}).get("nickname")
+                except Exception: pass
                 return data
         except Exception:
             continue
@@ -329,6 +332,7 @@ def root_index():
             "br_stats": "/stats/br?uid=YOUR_UID&mode=RANKED",
             "cs_stats": "/stats/cs?uid=YOUR_UID&mode=RANKED",
             "all_stats": "/stats/all?uid=YOUR_UID",
+            "access_info": "/access?token=ACCESS_TOKEN",
             "ban_check": "/bancheck?uid=YOUR_UID"
         }
     })
@@ -452,94 +456,133 @@ def get_ban_status():
         return jsonify({"error": f"Ban status unavailable: {e}"}), 502
 
 # ==============================================================================
-# 📊 STATS (সোর্স: flash-player-info-v1 — আমাদের প্রোটো ফাইলে stats মেসেজ নেই)
-# ⚠️ সোর্স না পেলে নকল/হার্ডকোড ডেটা দেওয়া হয় না — 502 এরর ফেরত যায়
+# 📊 STATS — সরাসরি Garena সার্ভার থেকে (GetPlayerStats), Flash লাগে না
+#   রিকোয়েস্ট : ফিল্ড১=accountid, ফিল্ড২=matchmode (0=CAREER, 1=NORMAL, 2=RANKED)
+#   রেসপন্স   : ফিল্ড১=solo, ২=duo, ৩=squad। প্রতিটার ভেতরে: ১=uid ২=games ৩=wins ৪=kills ৫=detailed
+#   detailed  : ১=deaths ৩=top_n ৪=distance(m) ৫=survival(s) ৬=revives ৭=highest_kills ৮=damage
+#               ৯=roadkills ১০=headshot_hits ১১=headshot_kills ১২=knockdowns ১৩=pickups
+#   ✅ UID 7703449332-এর ইন-গেম সংখ্যার সাথে মিলিয়ে যাচাই-করা (BR)। ⚠️ CS এই এন্ডপয়েন্টে পাওয়া যায়নি।
 # ==============================================================================
-STATS_UPSTREAM = os.environ.get("STATS_API_URL", "").rstrip("/")   # খালি = কোনো বাইরের (Flash) স্ট্যাটস API ব্যবহার হবে না
+MATCHMODE = {"CAREER": 0, "NORMAL": 1, "RANKED": 2}
+NICK_CACHE = {}          # uid -> nickname (get_player_data ভরে দেয়)
+REPORT_TO = "@xen_shorif"
 
-STATS_REASONS = {}   # (uid, mode, kind) -> শেষ ব্যর্থতার কারণ
+def _as_msg(node):
+    """নেস্টেড মেসেজ ঠিকমতো dict হিসেবে; ছাপার-যোগ্য বাইটের কারণে স্ট্রিং হয়ে গেলে আবার পার্স"""
+    if isinstance(node, dict): return node
+    if isinstance(node, str):
+        try: return parse_wire(node.encode("utf-8"))
+        except Exception: return {}
+    return {}
 
-def fetch_stats_raw(uid, match_mode, kind):
-    key = (uid, match_mode, kind); reason = {}
-    if not STATS_UPSTREAM:
-        STATS_REASONS[key] = {"why": "নিজস্ব Garena স্ট্যাটস ডিকোডার এখনও বসানো হয়নি — /stats-calibrate চালিয়ে আউটপুট পাঠান"}
-        return None
-    for timeout in (6.0, 3.0):
-        t0 = time.time()
-        try:
-            with httpx.Client(timeout=timeout, verify=False) as client:
-                r = client.get(f"{STATS_UPSTREAM}/{match_mode}/{kind}", params={"uid": uid}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
-            reason = {"upstream_status": r.status_code, "ms": int((time.time() - t0) * 1000), "body": r.text[:160]}
-            if r.status_code == 200:
-                d = r.json()
-                if isinstance(d, dict) and d:
-                    STATS_REASONS.pop(key, None); return d
-                reason["why"] = "empty or non-object JSON"
-        except Exception as e:
-            reason = {"exception": type(e).__name__, "detail": str(e)[:100], "ms": int((time.time() - t0) * 1000), "timeout_s": timeout}
-    if len(STATS_REASONS) > 300: STATS_REASONS.clear()
-    STATS_REASONS[key] = reason
-    return None
+def _f(d, k):
+    v = d.get(k) if isinstance(d, dict) else None
+    return v[0] if isinstance(v, list) and v else None
 
-def build_br(uid, match_mode):
-    raw = fetch_stats_raw(uid, match_mode, "br")
-    if raw is None: return None
-    sq, du, so = (calculate_br_mode(raw.get(k) or {}) for k in ("quadstats", "duostats", "solostats"))
-    return {"uid": uid, "nickname": raw.get("nickname"), "mode": match_mode, "squad": sq, "duo": du, "solo": so,
-            "has_data": any(x["games_played"] > 0 for x in (sq, du, so))}
+def _int(x): return x if isinstance(x, int) else 0
 
-def build_cs(uid, match_mode):
-    raw = fetch_stats_raw(uid, match_mode, "cs")
-    if raw is None: return None
-    cs = raw.get("csstats") or {}
-    det = cs.get("detailedstats") or {}
-    played, wins, kills = cs.get("gamesplayed", 0) or 0, cs.get("wins", 0) or 0, cs.get("kills", 0) or 0
-    deaths, assists = det.get("deaths", 0) or 0, det.get("assists", 0) or 0
-    hs = det.get("headShotKills", det.get("headshots", 0)) or 0
-    kda = round((kills + assists) / deaths, 2) if deaths > 0 else float(kills + assists)
-    kd = round(kills / deaths, 2) if deaths > 0 else float(kills)
+def _fmt_dur(sec):
+    sec = int(sec); return f"{sec // 60}m {sec % 60:02d}s"
+
+def parse_br_mode(sub):
+    sub = _as_msg(sub)
+    games, wins, kills = _int(_f(sub, "2")), _int(_f(sub, "3")), _int(_f(sub, "4"))
+    det = _as_msg(_f(sub, "5"))
+    g = lambda k: _int(_f(det, k))
+    deaths, hs_kills, damage = g("1"), g("11"), g("8")
+    avg = lambda x: round(x / games, 2) if games else 0
     return {
-        "uid": uid, "nickname": raw.get("nickname"), "mode": match_mode, "has_data": played > 0,
-        "matches": played, "wins": wins, "win_rate": f"{round(wins / played * 100, 2) if played else 0.0}%",
-        "kills": kills, "deaths": deaths, "assists": assists, "kd_ratio": kd, "official_kda": kda,
-        "headshot_kills": hs, "headshot_rate": f"{round(hs / kills * 100, 2) if kills else 0.0}%",
-        "damage": det.get("damage", 0) or 0, "mvp": det.get("mvpCount", 0) or 0,
-        "double_kills": det.get("doubleKills", 0) or 0, "triple_kills": det.get("tripleKills", 0) or 0,
-        "quadra_kills": det.get("fourKills", 0) or 0
+        "games_played": games, "wins": wins, "win_rate": f"{round(wins / games * 100, 2) if games else 0.0}%",
+        "kills": kills, "deaths": deaths, "kd_ratio": round(kills / deaths, 2) if deaths > 0 else float(kills),
+        "headshot_kills": hs_kills, "headshot_rate": f"{round(hs_kills / kills * 100, 2) if kills else 0.0}%",
+        "damage": damage, "highest_kills": g("7"),
+        "top_n": g("3"), "top_n_rate": f"{round(g('3') / games * 100, 2) if games else 0.0}%",
+        "knockdowns": g("12"), "roadkills": g("9"), "revives": g("6"), "pickups": g("13"), "headshot_hits": g("10"),
+        "avg_damage": round(damage / games) if games else 0,
+        "avg_survival": _fmt_dur(g("5") / games) if games else "0m 00s",
+        "avg_distance_km": round(g("4") / games / 1000, 2) if games else 0.0,
+        "total_distance_m": g("4"), "total_survival_s": g("5"),
     }
 
-def stats_route(builder):
-    uid = request.args.get('uid')
-    mode = request.args.get('mode', 'RANKED').upper()
-    if not uid or not uid.isdigit(): return jsonify({"error": "Numeric UID is required"}), 400
-    match_mode = "RANKED" if mode == "RANKED" else "CAREER"
-    res = builder(uid, match_mode)
-    if res is None:
-        kind = "br" if builder is build_br else "cs"
-        return jsonify({"error": "Stats source unavailable. Please try again.", "uid": uid, "mode": match_mode, "reason": STATS_REASONS.get((uid, match_mode, kind), {})}), 502
-    return jsonify(res)
+def garena_stats(uid, mm, region=None):
+    """→ (tree, None) বা (None, {"stage","http","detail"})"""
+    region = region or uid_region_cache.get(uid) or "BD"
+    deadline = time.time() + 8.5
+    err = {"stage": "token", "detail": "কোনো গেস্ট আইডির টোকেন পাওয়া যায়নি"}
+    pool = ordered_accounts(region)
+    if not pool:
+        return None, {"stage": "config", "detail": f"{region} পুলে কোনো গেস্ট আইডি নেই"}
+    for cred in pool[:3]:
+        if time.time() > deadline:
+            err = {"stage": "timeout", "detail": "সময়সীমা (৮.৫ সেকেন্ড) শেষ"}; break
+        info = request_token(cred, region, deadline=deadline)
+        if not info:
+            mark_bad(cred["uid"]); continue
+        raw = _varint(1 << 3) + _varint(int(uid)) + _varint(2 << 3) + _varint(mm)
+        headers = {'User-Agent': USERAGENT, 'Content-Type': "application/octet-stream", 'Authorization': info["token"], 'X-Unity-Version': "2018.4.11f1", 'X-GA': "v1 1", 'ReleaseVersion': RELEASEVERSION}
+        try:
+            with httpx.Client(timeout=5.0, verify=False) as client:
+                r = client.post(info["server_url"].rstrip('/') + "/GetPlayerStats", content=aes_cbc_encrypt(MAIN_KEY, MAIN_IV, raw), headers=headers)
+        except Exception as e:
+            err = {"stage": "garena", "detail": f"{type(e).__name__}: {str(e)[:60]}"}; continue
+        if r.status_code == 200 and r.content:
+            try:
+                tree = parse_wire(r.content)
+            except Exception as e:
+                err = {"stage": "decode", "detail": str(e)[:60]}; continue
+            if any(k in tree for k in ("1", "2", "3")):
+                return tree, None
+            err = {"stage": "decode", "detail": "সাড়ায় solo/duo/squad নেই"}; continue
+        if r.status_code in (401, 403):
+            mark_bad(cred["uid"]); err = {"stage": "garena", "http": r.status_code, "detail": "টোকেন বাতিল/নিষিদ্ধ"}; continue
+        err = {"stage": "garena", "http": r.status_code, "detail": "খালি সাড়া" if r.status_code == 200 else f"Garena {r.status_code}"}
+    return None, err
 
-# 5. 🏆 BR STATS
+def build_br(uid, mode_name):
+    mm = MATCHMODE[mode_name]
+    tree, err = garena_stats(uid, mm)
+    if tree is None: return None, err
+    solo, duo, squad = (parse_br_mode(tree.get(k, [None])[0] if tree.get(k) else None) for k in ("1", "2", "3"))
+    return {"uid": uid, "nickname": NICK_CACHE.get(uid), "mode": mode_name, "solo": solo, "duo": duo, "squad": squad,
+            "has_data": any(x["games_played"] > 0 for x in (solo, duo, squad))}, None
+
+def stats_error(err, uid, mode_name):
+    return jsonify({"error": "Stats পাওয়া যায়নি", "stage": err.get("stage"), "http": err.get("http"), "detail": err.get("detail"),
+                    "uid": uid, "mode": mode_name, "report_to": REPORT_TO}), 502
+
+def _mode_arg():
+    m = request.args.get("mode", "RANKED").upper()
+    return m if m in MATCHMODE else "RANKED"
+
+# 5. 🏆 BR STATS  (mode=RANKED | CAREER | NORMAL)
 @app.route('/stats/br', methods=['GET'])
-def get_br_stats(): return stats_route(build_br)
+def get_br_stats():
+    uid = request.args.get('uid')
+    if not uid or not uid.isdigit(): return jsonify({"error": "Numeric UID is required"}), 400
+    res, err = build_br(uid, _mode_arg())
+    return jsonify(res) if res else stats_error(err, uid, _mode_arg())
 
-# 6. ⚔️ CS STATS
+# 6. ⚔️ CS STATS — এই সার্ভারে পাওয়া যায়নি
 @app.route('/stats/cs', methods=['GET'])
-def get_cs_stats(): return stats_route(build_cs)
+def get_cs_stats():
+    return jsonify({"error": "CS stats সমর্থিত নয়", "supported": False,
+                    "detail": "GetPlayerStats সব ক্ষেত্রেই BR ডেটা দেয়; CS বাছাই করার উপায় এখনও পাওয়া যায়নি",
+                    "uid": request.args.get("uid"), "report_to": REPORT_TO}), 501
 
-# 7. 📊 ALL-IN-ONE (BR+CS, RANKED+CAREER একসাথে, সমান্তরালে)
+# 7. 📊 ALL-IN-ONE (BR Ranked + Career একসাথে; CS নেই)
 @app.route('/stats/all', methods=['GET'])
 def get_all_stats():
     uid = request.args.get('uid')
     if not uid or not uid.isdigit(): return jsonify({"error": "Numeric UID is required"}), 400
     from concurrent.futures import ThreadPoolExecutor
-    jobs = {"br_ranked": (build_br, "RANKED"), "br_career": (build_br, "CAREER"), "cs_ranked": (build_cs, "RANKED"), "cs_career": (build_cs, "CAREER")}
-    with ThreadPoolExecutor(max_workers=4) as ex:
-        futs = {k: ex.submit(fn, uid, m) for k, (fn, m) in jobs.items()}
-        out = {k: f.result() for k, f in futs.items()}
-    out["uid"] = uid
-    out["errors"] = [k for k, v in out.items() if k != "uid" and v is None]
-    out["reasons"] = {k: STATS_REASONS.get((uid, jobs[k][1], "br" if k.startswith("br") else "cs"), {}) for k in out["errors"]}
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(build_br, uid, "RANKED"), ex.submit(build_br, uid, "CAREER")
+        (r1, e1), (r2, e2) = f1.result(), f2.result()
+    out = {"uid": uid, "nickname": NICK_CACHE.get(uid), "br_ranked": r1, "br_career": r2,
+           "cs_ranked": None, "cs_career": None, "cs_supported": False}
+    out["errors"] = [k for k, v in (("br_ranked", r1), ("br_career", r2)) if v is None]
+    out["reasons"] = {k: e for k, e in (("br_ranked", e1), ("br_career", e2)) if e}
+    out["report_to"] = REPORT_TO
     return jsonify(out)
 
 
@@ -583,12 +626,17 @@ def token_passthrough():
     if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
     uid_g, pwd = request.values.get("uid", "").strip(), request.values.get("password", "").strip()
     if not uid_g.isdigit() or not pwd:
-        return jsonify({"error": "uid (numeric) আর password দিন"}), 400
+        return jsonify({"error": "uid (numeric) আর password দিন", "report_to": REPORT_TO}), 400
     res = request_token({"uid": uid_g, "password": pwd}, request.values.get("region", "BD"), detail=True)
-    if not res["winner"]:
-        return jsonify({"error": "Token generate হয়নি (আইডি/পাসওয়ার্ড ভুল, ব্যান, বা সার্ভিস বন্ধ)", "tried": [{"source": r["source"], "error": r["error"]} for r in res["results"]]}), 502
-    info = cached_tokens.get(uid_g, {})
-    return jsonify({"source": res["winner"], "token": info.get("token", "")[7:], "serverUrl": info.get("server_url"), "region": info.get("region"), "expires_at": info.get("expires_at")})
+    win = next((r for r in res["results"] if r["info"]), None)
+    if not win:
+        return jsonify({"error": "Token generate হয়নি (আইডি/পাসওয়ার্ড ভুল, ব্যান, বা সার্ভিস বন্ধ)",
+                        "tried": [{"source": r["source"], "error": r["error"]} for r in res["results"]], "report_to": REPORT_TO}), 502
+    info = win["info"]; jwt = info["token"][7:]
+    out = {"source": win["source"], "token": jwt, "serverUrl": info["server_url"], "region": info["region"], "expires_at": info["expires_at"]}
+    out.update(info.get("extra") or {})
+    out["payload"] = _jwt_payload(jwt)
+    return jsonify(out)
 
 # 10. 🧪 STATS PROBE — শুধু ডায়াগনস্টিক। Garena-র স্ট্যাটস রেসপন্সের কাঁচা (স্কিমাহীন) ডিকোড দেখায়।
 #     ⚠️ এন্ডপয়েন্ট নাম/রিকোয়েস্ট ফরম্যাট আমার যাচাই করা নয় — ফলাফল দেখে মিলিয়ে নেওয়ার জন্য।
@@ -820,6 +868,29 @@ def stats_raw():
     new_count = sum(1 for x in out if x.get("NEW_RESPONSE"))
     return jsonify({"uid": uid, "endpoint": path, "base_matchmode": mm0, "tried": len(variants) - 1, "new_responses": new_count,
                     "note": "NEW_RESPONSE=true মানে বেসলাইন বা আগের কোনো সাড়ার চেয়ে আলাদা — এটাই নতুন কিছু", "results": out})
+
+# 13. 🔑 ACCESS TOKEN INFO — Garena OAuth সার্ভারে টোকেনের তথ্য (⚠️ এন্ডপয়েন্ট আমার স্মৃতি থেকে, যাচাই-করা নয়)
+ACCESS_INSPECT_URL = os.environ.get("ACCESS_INSPECT_URL", "https://100067.connect.garena.com/oauth/token/inspect")
+
+@app.route('/access', methods=['GET', 'POST'])
+def access_info():
+    if not admin_ok(): return jsonify({"error": "unauthorized"}), 401
+    tok = (request.values.get("token") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{32,128}", tok):
+        return jsonify({"error": "access token ফরম্যাট ঠিক নয় (৩২-১২৮টা হেক্স অক্ষর হতে হবে)", "report_to": REPORT_TO}), 400
+    try:
+        with httpx.Client(timeout=7.0, verify=False) as client:
+            r = client.get(ACCESS_INSPECT_URL, params={"token": tok}, headers={"User-Agent": USERAGENT, "Accept": "application/json"})
+    except Exception as e:
+        return jsonify({"error": "Garena সার্ভারে পৌঁছানো যায়নি", "detail": f"{type(e).__name__}: {str(e)[:60]}", "report_to": REPORT_TO}), 502
+    try: d = r.json()
+    except Exception: d = None
+    if r.status_code != 200 or not isinstance(d, dict) or d.get("error"):
+        return jsonify({"error": "Access token যাচাই হয়নি", "http": r.status_code, "detail": (str(d.get("error")) if isinstance(d, dict) and d.get("error") else r.text[:100]), "report_to": REPORT_TO}), 502
+    times = {}
+    for k, v in d.items():
+        if isinstance(v, (int, float)) and 1_000_000_000 < v < 4_000_000_000: times[k] = _fmt_ts(v)
+    return jsonify({"info": d, "times": {k: v for k, v in times.items() if v}})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
